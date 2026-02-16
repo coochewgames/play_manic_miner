@@ -23,7 +23,7 @@ You need a Fuse build with the ML socket bridge enabled.
 
 In this workspace, that is:
 
-- Fuse version forked by Coo Chew Games: **1.6.0** (`fuse --version`)
+- Fuse version forked by Coo Chew Games: **1.6.0 (mlbridge-r1)** (`fuse --version`)
 - With ML bridge sources present:
   - `fuse/ml_bridge.c`
   - `fuse/ml_game_adapter.c`
