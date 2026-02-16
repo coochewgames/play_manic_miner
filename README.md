@@ -6,11 +6,11 @@ RL training setup for **Manic Miner** using a custom **Fuse ML socket bridge** a
 
 This folder contains the Python side of the training loop:
 
-- `/Users/roddy/Dev/fuse/play_manic_miner/train.py`: PPO training entrypoint.
-- `/Users/roddy/Dev/fuse/play_manic_miner/manic_env.py`: Gymnasium env orchestration and bridge calls.
-- `/Users/roddy/Dev/fuse/play_manic_miner/manic_data.py`: stable game memory map + data interpretation.
-- `/Users/roddy/Dev/fuse/play_manic_miner/manic_play.py`: gameplay logic and reward shaping.
-- `/Users/roddy/Dev/fuse/play_manic_miner/ml_client.py`: low-level UNIX socket client.
+- `play_manic_miner/train.py`: PPO training entrypoint.
+- `play_manic_miner/manic_env.py`: Gymnasium env orchestration and bridge calls.
+- `play_manic_miner/manic_data.py`: stable game memory map + data interpretation.
+- `play_manic_miner/manic_play.py`: gameplay logic and reward shaping.
+- `play_manic_miner/ml_client.py`: low-level UNIX socket client.
 
 Design intent:
 
@@ -23,10 +23,10 @@ You need a Fuse build with the ML socket bridge enabled.
 
 In this workspace, that is:
 
-- Fuse version: **1.6.0** (`fuse --version`)
+- Fuse version forked by Coo Chew Games: **1.6.0** (`fuse --version`)
 - With ML bridge sources present:
-  - `/Users/roddy/Dev/fuse/fuse/ml_bridge.c`
-  - `/Users/roddy/Dev/fuse/fuse/ml_game_adapter.c`
+  - `fuse/ml_bridge.c`
+  - `fuse/ml_game_adapter.c`
 
 This project expects the socket command set including:
 
@@ -62,7 +62,7 @@ Typical dependencies:
 Example setup:
 
 ```bash
-cd /Users/roddy/Dev/fuse/play_manic_miner
+cd play_manic_miner
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -76,7 +76,6 @@ Before running training, launch Fuse with ML env vars.
 Minimum required env vars:
 
 - `FUSE_ML_MODE=1`
-- `FUSE_ML_GAME=MANIC_MINER`
 - `FUSE_ML_SOCKET=/tmp/fuse-ml.sock`
 - `FUSE_ML_RESET_SNAPSHOT=/absolute/path/to/manicminer.szx`
 
@@ -92,10 +91,9 @@ Example:
 
 ```bash
 FUSE_ML_MODE=1 \
-FUSE_ML_GAME=MANIC_MINER \
 FUSE_ML_SOCKET=/tmp/fuse-ml.sock \
-FUSE_ML_RESET_SNAPSHOT=/Users/roddy/Dev/fuse/play_manic_miner/manicminer.szx \
-/Users/roddy/Dev/fuse/fuse/fuse --speed 300
+FUSE_ML_RESET_SNAPSHOT=play_manic_miner/manicminer.szx \
+fuse --speed 300
 ```
 
 ## Run training
@@ -103,7 +101,7 @@ FUSE_ML_RESET_SNAPSHOT=/Users/roddy/Dev/fuse/play_manic_miner/manicminer.szx \
 Example command:
 
 ```bash
-/Users/roddy/Dev/fuse/play_manic_miner/.venv/bin/python /Users/roddy/Dev/fuse/play_manic_miner/train.py \
+play_manic_miner/.venv/bin/python play_manic_miner/train.py \
   --visual \
   --socket /tmp/fuse-ml.sock \
   --timesteps 300000 \
@@ -157,7 +155,7 @@ Example:
 
 ```bash
 MANIC_PLAY_MODULE=manic_play_variant_a \
-/Users/roddy/Dev/fuse/play_manic_miner/.venv/bin/python /Users/roddy/Dev/fuse/play_manic_miner/train.py --timesteps 100000
+play_manic_miner/.venv/bin/python play_manic_miner/train.py --timesteps 100000
 ```
 
 Create additional variants beside `manic_play.py` to compare reward/action policies with the same data layer.
