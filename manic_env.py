@@ -86,11 +86,13 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self.visited_cells: Set[Tuple[int, int]] = set()
         self.configured_lethal_attrs_by_level: Dict[int, Set[int]] = {}
         self.configured_lethal_attr_groups_by_level: Dict[int, Tuple[Set[int], Set[int]]] = {}
+        self._rewarded_under_lethal_cells: Set[Tuple[int, int, int]] = set()
         self._last_dynamic_lethal_cells_count = 0
         self._last_repeat_signature: Optional[Tuple[int, ...]] = None
         self._repeat_signature_count = 0
         self._supports_episode_step_keys: Optional[bool] = None
         self._last_action_key_chord = "-"
+        self._last_action_used: Optional[int] = None
 
     def _rng_random(self) -> float:
         if hasattr(self, "np_random") and self.np_random is not None:
@@ -180,6 +182,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self.step_count = 0
         self._last_repeat_signature = None
         self._repeat_signature_count = 0
+        self._last_action_used = None
+        self._rewarded_under_lethal_cells.clear()
 
         info["state"] = state.__dict__.copy()
         info["first_key_mode"] = self.first_key_mode
@@ -244,6 +248,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         ep = self._episode_step_with_action(action_used, frames_used)
         state = self._read_state()
+        attr_buffer_after = self._read_attr_buffer()
+        dynamic_lethal_cells_after = self._dynamic_lethal_cells_for_level(state.level, attr_buffer_after)
         airborne_status_after = self._read_u8(WILLY_AIRBORNE_ADDR)
         life_lost_this_step = self.prev_state is not None and state.lives < self.prev_state.lives
 
@@ -254,10 +260,21 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             hazard_reward,
             pathing_reward,
             repeat_penalty,
+            walk_reward,
+            under_lethal_reward,
             repeat_detected,
             repeat_count,
             repeat_reason,
-        ) = self._compute_reward(state, ep["reward"], first_key_achieved_now, action_used)
+            walk_reason,
+            under_lethal_reason,
+        ) = self._compute_reward(
+            state,
+            ep["reward"],
+            first_key_achieved_now,
+            action_used,
+            self._last_action_used,
+            dynamic_lethal_cells_after,
+        )
 
         bridge_done = bool(ep["done"])
         first_key_terminated = self.first_key_mode and first_key_achieved_now
@@ -305,6 +322,10 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             "hazard_reward": hazard_reward,
             "pathing_reward": pathing_reward,
             "repeat_penalty": repeat_penalty,
+            "walk_reward": walk_reward,
+            "walk_reason": walk_reason,
+            "under_lethal_reward": under_lethal_reward,
+            "under_lethal_reason": under_lethal_reason,
             "repeat_detected": repeat_detected,
             "repeat_count": repeat_count,
             "repeat_reason": repeat_reason,
@@ -315,6 +336,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         if first_key_achieved_now:
             self.first_key_achieved = True
 
+        self._last_action_used = int(action_used)
         self.prev_state = state
         return self._normalize_observation(state.to_observation()), reward, terminated, truncated, info
 

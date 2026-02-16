@@ -23,6 +23,11 @@ PATHING_NEW_CELL_REWARD = 2.0
 REPEAT_TRANSITION_TOLERANCE = 1
 REPEAT_TRANSITION_PENALTY = 1.0
 REPEAT_TRANSITION_PENALTY_MAX = 8.0
+WALK_PROGRESS_REWARD_PER_PX = 0.03
+WALK_STREAK_BONUS = 0.2
+WALK_DIRECTION_FLIP_PENALTY = 0.6
+WALK_NO_PROGRESS_PENALTY = 0.2
+WALK_UNDER_LETHAL_REWARD_PER_CELL = 0.6
 
 # Safety projection thresholds
 SAFETY_BLOCK_INTERSECTION_MIN_CELLS = 1
@@ -340,13 +345,89 @@ class ManicPlayMixin:
         reason = f"repeat_transition(count={self._repeat_signature_count},action={action_used})"
         return penalty, True, self._repeat_signature_count, reason
 
+    def _walk_behavior_reward(
+        self,
+        prev_state: Optional[ManicState],
+        state: ManicState,
+        action_used: int,
+        prev_action_used: Optional[int],
+    ) -> Tuple[float, str]:
+        if prev_state is None:
+            return 0.0, "-"
+        if action_used not in (1, 2):
+            return 0.0, "-"
+
+        x_delta = state.willy_x_px - prev_state.willy_x_px
+        expected_sign = -1 if action_used == 1 else 1
+        moved_in_expected_direction = x_delta * expected_sign > 0
+
+        reward = 0.0
+        reasons = []
+        if moved_in_expected_direction:
+            progress_px = abs(x_delta)
+            reward += WALK_PROGRESS_REWARD_PER_PX * float(progress_px)
+            reasons.append(f"walk_progress_px={progress_px}")
+            if prev_action_used == action_used:
+                reward += WALK_STREAK_BONUS
+                reasons.append("walk_streak")
+        else:
+            reward -= WALK_NO_PROGRESS_PENALTY
+            reasons.append("walk_no_progress")
+
+        if prev_action_used in (1, 2) and prev_action_used != action_used:
+            reward -= WALK_DIRECTION_FLIP_PENALTY
+            reasons.append("walk_direction_flip")
+
+        if not reasons:
+            return reward, "-"
+        return reward, ",".join(reasons)
+
+    def _walk_under_lethal_reward(
+        self,
+        prev_state: Optional[ManicState],
+        state: ManicState,
+        action_used: int,
+        dynamic_lethal_cells: Set[Tuple[int, int]],
+    ) -> Tuple[float, str]:
+        if prev_state is None:
+            return 0.0, "-"
+        if action_used not in (1, 2):
+            return 0.0, "-"
+        if not dynamic_lethal_cells:
+            return 0.0, "-"
+
+        x_delta = state.willy_x_px - prev_state.willy_x_px
+        expected_sign = -1 if action_used == 1 else 1
+        if x_delta * expected_sign <= 0:
+            return 0.0, "-"
+
+        overhead = self._cells_above_willy(state) & dynamic_lethal_cells
+        if not overhead:
+            return 0.0, "-"
+
+        newly_rewarded = 0
+        for x_cell, y_cell in overhead:
+            key = (state.level, x_cell, y_cell)
+            if key in self._rewarded_under_lethal_cells:
+                continue
+            self._rewarded_under_lethal_cells.add(key)
+            newly_rewarded += 1
+
+        if newly_rewarded <= 0:
+            return 0.0, "walk_under_lethal_repeat"
+        reward = WALK_UNDER_LETHAL_REWARD_PER_CELL * float(newly_rewarded)
+        reason = f"walk_under_lethal_new_cells={newly_rewarded}"
+        return reward, reason
+
     def _compute_reward(
         self,
         state: ManicState,
         bridge_reward: int,
         first_key_achieved: bool,
         action_used: int,
-    ) -> Tuple[float, float, float, float, float, bool, int, str]:
+        prev_action_used: Optional[int],
+        dynamic_lethal_cells: Set[Tuple[int, int]],
+    ) -> Tuple[float, float, float, float, float, float, float, bool, int, str, str, str]:
         if self.prev_state is None:
             objective = 0.0
             hazards = 0.0
@@ -377,10 +458,35 @@ class ManicPlayMixin:
             action_used,
             pathing,
         )
+        walk_reward, walk_reason = self._walk_behavior_reward(
+            self.prev_state,
+            state,
+            action_used,
+            prev_action_used,
+        )
+        under_lethal_reward, under_lethal_reason = self._walk_under_lethal_reward(
+            self.prev_state,
+            state,
+            action_used,
+            dynamic_lethal_cells,
+        )
 
-        reward = objective + hazards + pathing + repeat_penalty
+        reward = objective + hazards + pathing + repeat_penalty + walk_reward + under_lethal_reward
         if self.include_bridge_reward:
             reward += float(bridge_reward)
 
         state.coverage_ratio = self._coverage_ratio()
-        return reward, objective, hazards, pathing, repeat_penalty, repeat_detected, repeat_count, repeat_reason
+        return (
+            reward,
+            objective,
+            hazards,
+            pathing,
+            repeat_penalty,
+            walk_reward,
+            under_lethal_reward,
+            repeat_detected,
+            repeat_count,
+            repeat_reason,
+            walk_reason,
+            under_lethal_reason,
+        )
