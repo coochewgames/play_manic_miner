@@ -31,6 +31,8 @@ ACTION_KEY_CHORDS: Dict[int, str] = {
     5: "w+space",
 }
 
+WALK_FLIP_HYSTERESIS_STEPS = 2
+
 
 class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
     metadata = {"render_modes": []}
@@ -93,6 +95,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._supports_episode_step_keys: Optional[bool] = None
         self._last_action_key_chord = "-"
         self._last_action_used: Optional[int] = None
+        self._walk_flip_request_count = 0
 
     def _rng_random(self) -> float:
         if hasattr(self, "np_random") and self.np_random is not None:
@@ -150,6 +153,30 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._last_action_key_chord = key_chord
         return episode
 
+    def _apply_walk_direction_hysteresis(self, action: int) -> Tuple[int, bool, str]:
+        if action not in (1, 2):
+            self._walk_flip_request_count = 0
+            return action, False, "-"
+        prev_action = self._last_action_used
+        if prev_action not in (1, 2):
+            self._walk_flip_request_count = 0
+            return action, False, "-"
+        if action == prev_action:
+            self._walk_flip_request_count = 0
+            return action, False, "-"
+
+        self._walk_flip_request_count += 1
+        if self._walk_flip_request_count < WALK_FLIP_HYSTERESIS_STEPS:
+            reason = (
+                f"walk_hysteresis_hold(prev={prev_action},requested={action},"
+                f"count={self._walk_flip_request_count})"
+            )
+            return int(prev_action), True, reason
+
+        self._walk_flip_request_count = 0
+        reason = f"walk_hysteresis_allow_flip(prev={prev_action},requested={action})"
+        return action, False, reason
+
     def reset(
         self,
         *,
@@ -183,6 +210,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._last_repeat_signature = None
         self._repeat_signature_count = 0
         self._last_action_used = None
+        self._walk_flip_request_count = 0
         self._rewarded_under_lethal_cells.clear()
 
         info["state"] = state.__dict__.copy()
@@ -213,6 +241,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         local_jump_reason = "-"
         jump_gate_blocked = False
         jump_gate_reason = "-"
+        walk_hysteresis_applied = False
+        walk_hysteresis_reason = "-"
         safety_blocked = False
         safety_reason = "-"
         safety_overridden_by_jump_gate = False
@@ -238,6 +268,10 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
                 )
             else:
                 jump_gate_reason = "jump_gate_skipped_for_key_forced_jump"
+
+            action_used, walk_hysteresis_applied, walk_hysteresis_reason = self._apply_walk_direction_hysteresis(
+                action_used
+            )
             action_used, safety_blocked, safety_reason = self._apply_safety_shield(
                 state_before, action_used, attr_buffer_before
             )
@@ -307,6 +341,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             "local_jump_reason": local_jump_reason,
             "jump_gate_blocked": jump_gate_blocked,
             "jump_gate_reason": jump_gate_reason,
+            "walk_hysteresis_applied": walk_hysteresis_applied,
+            "walk_hysteresis_reason": walk_hysteresis_reason,
             "safety_blocked": safety_blocked,
             "safety_reason": safety_reason,
             "safety_overridden_by_jump_gate": safety_overridden_by_jump_gate,
