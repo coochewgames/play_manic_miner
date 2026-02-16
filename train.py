@@ -26,8 +26,6 @@ class StatusWindow:
         self._title = title
         self._fields = [
             ("Timestep", "timestep"),
-            ("Agent Input", "agent_action"),
-            ("Action Used", "action_used"),
             ("Key Chord", "action_key_chord"),
             ("Local Jump", "local_jump_forced"),
             ("Local Blocked", "local_jump_blocked"),
@@ -135,8 +133,6 @@ class StatusWindowCallback(BaseCallback):
         reward = rewards[0] if len(rewards) > 0 else "-"
         values = {
             "timestep": self.num_timesteps,
-            "agent_action": info.get("agent_action", "-"),
-            "action_used": info.get("action_used", "-"),
             "action_key_chord": info.get("action_key_chord", "-"),
             "local_jump_forced": info.get("local_jump_forced", "-"),
             "local_jump_blocked": info.get("local_jump_blocked", "-"),

@@ -220,8 +220,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
     def step(self, action: int):
         self.step_count += 1
 
-        agent_action = int(action)
-        action_used = agent_action
+        action_used = int(action)
         frames_used = self.frames_per_action
         random_action_applied = False
         state_before = self.prev_state if self.prev_state is not None else self._read_state()
@@ -324,8 +323,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             "bridge_done": ep["done"],
             "bridge_reset": ep["reset"],
             "state": state.__dict__.copy(),
-            "agent_action": agent_action,
-            "action_used": action_used,
             "action_key_chord": self._last_action_key_chord,
             "frames_used": frames_used,
             "random_action_applied": random_action_applied,
