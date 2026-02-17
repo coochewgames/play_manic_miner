@@ -31,6 +31,7 @@ PORTAL_POS_OFFSET = 0x02B0
 ITEMS_OFFSET = 0x0275
 ITEMS_COUNT = 5
 ITEM_STRIDE = 5
+ITEM_INK_CYCLE = (0x03, 0x06, 0x05, 0x04)  # magenta, yellow, cyan, green
 NASTY1_OFFSET = 0x024D
 NASTY2_OFFSET = 0x0256
 H_GUARD_OFFSET = 0x02BE
@@ -157,24 +158,63 @@ class ManicDataMixin:
         y_px = ((packed_pos >> 5) & 0x0F) * CELL_SIZE_PX
         return x_px, y_px
 
-    def _count_items_remaining_for_level(self, level: int) -> int:
+    def _iter_item_slots_for_level(self, level: int) -> list[Tuple[int, Tuple[int, int]]]:
+        if level < 0:
+            return []
+        room = self._read_room_bytes(level)
+        if not room:
+            return []
+
+        slots: list[Tuple[int, Tuple[int, int]]] = []
+        for slot in range(ITEMS_COUNT):
+            base = ITEMS_OFFSET + (slot * ITEM_STRIDE)
+            if base + ITEM_STRIDE > len(room):
+                break
+            item_attr = int(room[base])
+            if item_attr == 0xFF:
+                break
+            if item_attr == 0x00:
+                continue
+            decoded = self._decode_item_cell(int(room[base + 1]), int(room[base + 2]), int(room[base + 3]))
+            if decoded is None:
+                continue
+            slots.append((item_attr, decoded))
+        return slots
+
+    def _count_configured_items_for_level(self, level: int) -> int:
+        return len(self._iter_item_slots_for_level(level))
+
+    def _item_attr_candidates(self, item_attr: int) -> Set[int]:
+        # Keep paper/bright/flash metadata and allow all item ink-cycle phases.
+        base = int(item_attr) & 0xF8
+        candidates = {(base | ink) & 0xFF for ink in ITEM_INK_CYCLE}
+        candidates.add(int(item_attr) & 0xFF)
+        return candidates
+
+    def _is_item_visible_at_cell(self, attr_buffer: bytes, item_attr: int, cell: Tuple[int, int]) -> bool:
+        x_cell, y_cell = cell
+        if x_cell < 0 or x_cell >= SCREEN_CELLS_W:
+            return False
+        if y_cell < 0 or y_cell >= SCREEN_CELLS_H:
+            return False
+        idx = (y_cell * SCREEN_CELLS_W) + x_cell
+        if idx < 0 or idx >= len(attr_buffer):
+            return False
+        live_attr = int(attr_buffer[idx]) & 0x7F
+        for candidate in self._item_attr_candidates(item_attr):
+            if live_attr == (candidate & 0x7F):
+                return True
+        return False
+
+    def _count_items_remaining_for_level(self, level: int, attr_buffer: Optional[bytes] = None) -> int:
         if level < 0:
             return 0
-        room_base = ROOM_DATA_BASE_ADDR + (ROOM_DATA_SIZE * level)
-        item_block_addr = room_base + ITEMS_OFFSET
-        item_block_len = ITEMS_COUNT * ITEM_STRIDE
-        if item_block_addr + item_block_len - 1 > 0xFFFF:
-            return 0
-
-        item_block = self.client.read_bytes(item_block_addr, item_block_len)
+        if attr_buffer is None:
+            attr_buffer = self._read_attr_buffer()
         count = 0
-        for slot in range(ITEMS_COUNT):
-            attr = item_block[slot * ITEM_STRIDE]
-            if attr == 0xFF:
-                break
-            if attr == 0x00:
-                continue
-            count += 1
+        for item_attr, cell in self._iter_item_slots_for_level(level):
+            if self._is_item_visible_at_cell(attr_buffer, item_attr, cell):
+                count += 1
         return count
 
     def _decode_item_cell(self, pos0: int, pos1: int, pos2: int) -> Optional[Tuple[int, int]]:
@@ -191,26 +231,17 @@ class ManicDataMixin:
             return None
         return x_cell, y_cell
 
-    def _active_item_cells_for_level(self, level: int) -> Set[Tuple[int, int]]:
+    def _active_item_cells_for_level(
+        self, level: int, attr_buffer: Optional[bytes] = None
+    ) -> Set[Tuple[int, int]]:
         if level < 0:
             return set()
-        room = self._read_room_bytes(level)
-        if not room:
-            return set()
-
+        if attr_buffer is None:
+            attr_buffer = self._read_attr_buffer()
         cells: Set[Tuple[int, int]] = set()
-        for slot in range(ITEMS_COUNT):
-            base = ITEMS_OFFSET + (slot * ITEM_STRIDE)
-            if base + ITEM_STRIDE > len(room):
-                break
-            attr = int(room[base])
-            if attr == 0xFF:
-                break
-            if attr == 0x00:
-                continue
-            decoded = self._decode_item_cell(int(room[base + 1]), int(room[base + 2]), int(room[base + 3]))
-            if decoded is not None:
-                cells.add(decoded)
+        for item_attr, cell in self._iter_item_slots_for_level(level):
+            if self._is_item_visible_at_cell(attr_buffer, item_attr, cell):
+                cells.add(cell)
         return cells
 
     def _read_attr_buffer(self) -> bytes:
@@ -364,7 +395,9 @@ class ManicDataMixin:
     def _read_state(self) -> ManicState:
         willy_x_px, willy_y_px = self._read_willy_xy()
         level = self._read_u8(LEVEL_ADDR)
-        keys_remaining = self._count_items_remaining_for_level(level)
+        # Use configured item count as a stable baseline; env-level tracking
+        # handles collected-key decrementing from score/life transitions.
+        keys_remaining = self._count_configured_items_for_level(level)
         return ManicState(
             air=self._read_u16_be(AIR_HI_ADDR),
             level=level,

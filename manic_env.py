@@ -32,6 +32,7 @@ ACTION_KEY_CHORDS: Dict[int, str] = {
 }
 
 WALK_FLIP_HYSTERESIS_STEPS = 2
+KEY_SCORE_INCREMENT = 100
 
 
 class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
@@ -96,6 +97,9 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._last_action_key_chord = "-"
         self._last_action_used: Optional[int] = None
         self._walk_flip_request_count = 0
+        self._tracked_key_level: Optional[int] = None
+        self._tracked_keys_remaining = 0
+        self._tracked_key_score_anchor = 0
 
     def _rng_random(self) -> float:
         if hasattr(self, "np_random") and self.np_random is not None:
@@ -177,6 +181,29 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         reason = f"walk_hysteresis_allow_flip(prev={prev_action},requested={action})"
         return action, False, reason
 
+    def _stabilize_keys_remaining(self, state: ManicState, force_reset: bool = False) -> None:
+        configured = self._count_configured_items_for_level(state.level)
+        life_lost = self.prev_state is not None and state.lives < self.prev_state.lives
+        level_changed = self._tracked_key_level != state.level
+
+        if force_reset or level_changed or life_lost:
+            self._tracked_key_level = state.level
+            self._tracked_keys_remaining = configured
+            self._tracked_key_score_anchor = state.score
+        else:
+            score_delta = int(state.score) - int(self._tracked_key_score_anchor)
+            if score_delta >= KEY_SCORE_INCREMENT and self._tracked_keys_remaining > 0:
+                # At most one item can realistically be collected per env step.
+                collected = min(self._tracked_keys_remaining, score_delta // KEY_SCORE_INCREMENT, 1)
+                self._tracked_keys_remaining -= int(collected)
+                self._tracked_key_score_anchor += int(collected) * KEY_SCORE_INCREMENT
+            elif score_delta < 0:
+                # Score should not normally go backwards; re-anchor if it does.
+                self._tracked_key_score_anchor = state.score
+
+        state.keys_remaining = max(0, min(configured, int(self._tracked_keys_remaining)))
+        state.portal_open = 1 if state.keys_remaining == 0 else 0
+
     def reset(
         self,
         *,
@@ -197,6 +224,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             self._episode_step_with_action(action_used, frames_used)
 
         state = self._read_state()
+        self._stabilize_keys_remaining(state, force_reset=True)
         info = self.client.get_info()
 
         self.visited_cells.clear()
@@ -211,6 +239,9 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._repeat_signature_count = 0
         self._last_action_used = None
         self._walk_flip_request_count = 0
+        self._tracked_key_level = state.level
+        self._tracked_keys_remaining = state.keys_remaining
+        self._tracked_key_score_anchor = state.score
         self._rewarded_under_lethal_cells.clear()
 
         info["state"] = state.__dict__.copy()
@@ -231,7 +262,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         _, fixed_attrs = self._configured_lethal_attr_groups_for_level(safety_level)
         fixed_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
         dynamic_lethal_cells_before = self._dynamic_lethal_cells_for_level(safety_level, attr_buffer_before)
-        key_cells_before = self._active_item_cells_for_level(safety_level)
+        key_cells_before = self._active_item_cells_for_level(safety_level, attr_buffer_before)
         self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells_before)
         jump_above_blocked = False
         jump_above_reason = "-"
@@ -281,6 +312,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         ep = self._episode_step_with_action(action_used, frames_used)
         state = self._read_state()
+        self._stabilize_keys_remaining(state)
         attr_buffer_after = self._read_attr_buffer()
         dynamic_lethal_cells_after = self._dynamic_lethal_cells_for_level(state.level, attr_buffer_after)
         airborne_status_after = self._read_u8(WILLY_AIRBORNE_ADDR)
