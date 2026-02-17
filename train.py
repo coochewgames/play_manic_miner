@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import socket
 import sys
 from typing import Any, Dict
 
@@ -142,7 +143,7 @@ class StatusWindowCallback(BaseCallback):
             "repeat_reason": info.get("repeat_reason", "-"),
             "walk_reward": info.get("walk_reward", "-"),
             "walk_reason": info.get("walk_reason", "-"),
-            "under_lethal_reward": info.get("under_lethal_reward", "-"),
+            "under_lethal_reward": info.get("under_lethal_detected", "-"),
             "under_lethal_reason": info.get("under_lethal_reason", "-"),
             "walk_hysteresis_applied": info.get("walk_hysteresis_applied", "-"),
             "walk_hysteresis_reason": info.get("walk_hysteresis_reason", "-"),
@@ -171,6 +172,74 @@ class StatusWindowCallback(BaseCallback):
         if self.window is not None:
             self.window.close()
             self.window = None
+
+
+class RunSummaryCallback(BaseCallback):
+    """Collect and log run-level summary metrics."""
+
+    def __init__(self):
+        super().__init__()
+        self.max_level_seen = -1
+        self.configured_keys_by_level: Dict[int, int] = {}
+        self.min_keys_remaining_by_level: Dict[int, int] = {}
+        self.max_score_seen = 0
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        if not infos:
+            return True
+        info = infos[0] if isinstance(infos[0], dict) else {}
+        state = info.get("state", {}) if isinstance(info.get("state"), dict) else {}
+        level = state.get("level")
+        keys_remaining = state.get("keys_remaining")
+        score = state.get("score")
+        configured_keys = info.get("configured_keys_for_level")
+
+        if not isinstance(level, int) or not isinstance(keys_remaining, int):
+            return True
+
+        self.max_level_seen = max(self.max_level_seen, level)
+        if isinstance(score, int):
+            self.max_score_seen = max(self.max_score_seen, score)
+        if isinstance(configured_keys, int) and configured_keys >= 0:
+            prev_cfg = self.configured_keys_by_level.get(level, 0)
+            if configured_keys > prev_cfg:
+                self.configured_keys_by_level[level] = configured_keys
+            prev_min_remaining = self.min_keys_remaining_by_level.get(level, keys_remaining)
+            if keys_remaining < prev_min_remaining:
+                self.min_keys_remaining_by_level[level] = keys_remaining
+            else:
+                self.min_keys_remaining_by_level[level] = prev_min_remaining
+        return True
+
+    def _on_training_end(self) -> None:
+        if self.max_level_seen < 0:
+            logger.info("Run summary: no environment state samples captured")
+            return
+
+        reached_level = self.max_level_seen
+        configured_keys = self.configured_keys_by_level.get(reached_level)
+        min_keys_remaining = self.min_keys_remaining_by_level.get(reached_level)
+        cavern_number = reached_level + 1
+        if configured_keys is None or min_keys_remaining is None:
+            logger.info(
+                "Run summary: cavern reached in play testing=%s (level=%s), max keys collected in cavern reached=%s, highest score=%s",
+                cavern_number,
+                reached_level,
+                0,
+                self.max_score_seen,
+            )
+            return
+        bounded_remaining = max(0, min(configured_keys, min_keys_remaining))
+        max_keys_collected = max(0, configured_keys - bounded_remaining)
+        logger.info(
+            "Run summary: cavern reached in play testing=%s (level=%s), max keys collected in cavern reached=%s/%s, highest score=%s",
+            cavern_number,
+            reached_level,
+            max_keys_collected,
+            configured_keys,
+            self.max_score_seen,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -336,22 +405,46 @@ def main() -> None:
         )
 
     callbacks = []
+    callbacks.append(RunSummaryCallback())
     if args.visual and args.visual_steps > 0:
         callbacks.append(SwitchToHeadlessCallback(args.visual_steps))
     if args.status_window:
         callbacks.append(StatusWindowCallback(args.status_window_title, args.status_refresh_steps))
     callback = CallbackList(callbacks) if callbacks else None
 
+    learn_completed = False
+    timed_out = False
     try:
-        model.learn(
-            total_timesteps=args.timesteps,
-            progress_bar=not args.status_window,
-            callback=callback,
-            reset_num_timesteps=not bool(args.load_model),
-        )
-        model.save(args.model_out)
-        logger.info("Saved model to %s.zip", args.model_out)
+        try:
+            model.learn(
+                total_timesteps=args.timesteps,
+                progress_bar=not args.status_window,
+                callback=callback,
+                reset_num_timesteps=not bool(args.load_model),
+            )
+            learn_completed = True
+        except socket.timeout as exc:
+            timed_out = True
+            logger.warning(
+                "Fuse ML socket timed out during training; ending run early and saving partial model: %s",
+                exc,
+            )
     finally:
+        try:
+            model.save(args.model_out)
+            if learn_completed:
+                logger.info("Saved model to %s.zip", args.model_out)
+            elif timed_out:
+                logger.info("Saved partial model to %s.zip after timeout", args.model_out)
+            else:
+                logger.info("Saved model to %s.zip after interrupted training", args.model_out)
+        except Exception as exc:
+            logger.error("Failed to save model %s.zip: %s", args.model_out, exc)
+        try:
+            vec_env.env_method("quit_emulator")
+            logger.info("Sent QUIT to Fuse emulator")
+        except Exception as exc:
+            logger.warning("Could not send QUIT to Fuse emulator: %s", exc)
         vec_env.close()
 
 

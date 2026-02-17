@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -21,6 +22,7 @@ PLAY_MODULE_NAME = os.environ.get("MANIC_PLAY_MODULE", "manic_play")
 _play_module = importlib.import_module(PLAY_MODULE_NAME)
 ManicPlayMixin = _play_module.ManicPlayMixin
 PATHING_NEW_CELL_REWARD = _play_module.PATHING_NEW_CELL_REWARD
+logger = logging.getLogger(__name__)
 
 ACTION_KEY_CHORDS: Dict[int, str] = {
     0: "-",
@@ -315,6 +317,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._stabilize_keys_remaining(state)
         attr_buffer_after = self._read_attr_buffer()
         dynamic_lethal_cells_after = self._dynamic_lethal_cells_for_level(state.level, attr_buffer_after)
+        all_dynamic_lethal_cells = dynamic_lethal_cells_before | dynamic_lethal_cells_after
+        under_lethal_detected = int(self._is_under_lethal(state, all_dynamic_lethal_cells))
         airborne_status_after = self._read_u8(WILLY_AIRBORNE_ADDR)
         life_lost_this_step = self.prev_state is not None and state.lives < self.prev_state.lives
 
@@ -340,6 +344,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             self._last_action_used,
             dynamic_lethal_cells_after,
         )
+        if under_lethal_detected and under_lethal_reason == "-":
+            under_lethal_reason = "under_lethal_detected_no_reward"
 
         bridge_done = bool(ep["done"])
         first_key_terminated = self.first_key_mode and first_key_achieved_now
@@ -380,6 +386,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             "fixed_lethal_cells": len(fixed_lethal_cells_before),
             "visible_key_cells": len(key_cells_before),
             "life_lost_this_step": life_lost_this_step,
+            "configured_keys_for_level": self._count_configured_items_for_level(state.level),
             "first_key_mode": self.first_key_mode,
             "first_key_achieved": first_key_achieved_now,
             "first_key_terminated": first_key_terminated,
@@ -389,6 +396,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             "repeat_penalty": repeat_penalty,
             "walk_reward": walk_reward,
             "walk_reason": walk_reason,
+            "under_lethal_detected": under_lethal_detected,
             "under_lethal_reward": under_lethal_reward,
             "under_lethal_reason": under_lethal_reason,
             "repeat_detected": repeat_detected,
@@ -407,3 +415,9 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
     def close(self) -> None:
         self.client.close()
+
+    def quit_emulator(self) -> None:
+        try:
+            self.client.quit()
+        except Exception as exc:
+            logger.warning("Failed to send QUIT to Fuse ML bridge: %s", exc)

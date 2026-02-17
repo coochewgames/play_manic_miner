@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Optional, Set, Tuple
 
-from manic_data import CELL_SIZE_PX, ManicState
+from manic_data import CELL_SIZE_PX, SCREEN_CELLS_W, WILLY_SIZE_PX, ManicState
 
 
 # Objectives (positive)
@@ -28,6 +28,8 @@ WALK_STREAK_BONUS = 0.2
 WALK_DIRECTION_FLIP_PENALTY = 0.6
 WALK_NO_PROGRESS_PENALTY = 0.2
 WALK_UNDER_LETHAL_REWARD_PER_CELL = 0.6
+WALK_UNDER_LETHAL_VERTICAL_LOOKAHEAD_CELLS = 2
+WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS = 1
 
 # Safety projection thresholds
 SAFETY_BLOCK_INTERSECTION_MIN_CELLS = 1
@@ -382,6 +384,30 @@ class ManicPlayMixin:
             return reward, "-"
         return reward, ",".join(reasons)
 
+    def _under_lethal_overlap_cells(
+        self, state: ManicState, dynamic_lethal_cells: Set[Tuple[int, int]]
+    ) -> Set[Tuple[int, int]]:
+        if not dynamic_lethal_cells:
+            return set()
+        x0 = max(0, min(SCREEN_CELLS_W - 1, state.willy_x_px // CELL_SIZE_PX))
+        x1 = max(0, min(SCREEN_CELLS_W - 1, (state.willy_x_px + WILLY_SIZE_PX - 1) // CELL_SIZE_PX))
+        y_top = max(0, state.willy_y_px // CELL_SIZE_PX)
+        left_x = max(0, x0 - WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS)
+        right_x = min(SCREEN_CELLS_W - 1, x1 + WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS)
+        overlap: Set[Tuple[int, int]] = set()
+        for x_cell in range(left_x, right_x + 1):
+            for dy in range(0, WALK_UNDER_LETHAL_VERTICAL_LOOKAHEAD_CELLS + 1):
+                y_cell = y_top - dy
+                if y_cell < 0:
+                    break
+                cell = (x_cell, y_cell)
+                if cell in dynamic_lethal_cells:
+                    overlap.add(cell)
+        return overlap
+
+    def _is_under_lethal(self, state: ManicState, dynamic_lethal_cells: Set[Tuple[int, int]]) -> bool:
+        return bool(self._under_lethal_overlap_cells(state, dynamic_lethal_cells))
+
     def _walk_under_lethal_reward(
         self,
         prev_state: Optional[ManicState],
@@ -401,7 +427,7 @@ class ManicPlayMixin:
         if x_delta * expected_sign <= 0:
             return 0.0, "-"
 
-        overhead = self._cells_above_willy(state) & dynamic_lethal_cells
+        overhead = self._under_lethal_overlap_cells(state, dynamic_lethal_cells)
         if not overhead:
             return 0.0, "-"
 
@@ -414,9 +440,9 @@ class ManicPlayMixin:
             newly_rewarded += 1
 
         if newly_rewarded <= 0:
-            return 0.0, "walk_under_lethal_repeat"
+            return 0.0, "-"
         reward = WALK_UNDER_LETHAL_REWARD_PER_CELL * float(newly_rewarded)
-        reason = f"walk_under_lethal_new_cells={newly_rewarded}"
+        reason = f"walk_under_lethal_new_cells={newly_rewarded},overhead_cells={len(overhead)}"
         return reward, reason
 
     def _compute_reward(

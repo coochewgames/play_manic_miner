@@ -54,6 +54,9 @@ class FuseMLClient:
     def game(self) -> str:
         return self.cmd("GAME")
 
+    def quit(self) -> str:
+        return self.cmd("QUIT")
+
     def get_info(self) -> Dict[str, int]:
         parts = self.cmd("GETINFO").split()
         # INFO <frame_count> <tstates> <width> <height>
