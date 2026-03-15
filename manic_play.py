@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Optional, Set, Tuple
 
-from manic_data import CELL_SIZE_PX, SCREEN_CELLS_W, WILLY_SIZE_PX, ManicState
+from manic_data import CELL_SIZE_PX, SCREEN_CELLS_H, SCREEN_CELLS_W, WILLY_SIZE_PX, ManicState
 
 
 # Objectives (positive)
@@ -241,6 +241,45 @@ class ManicPlayMixin:
                 return candidate
         return 0
 
+    def _filter_ceiling_protected(
+        self,
+        fixed_lethal: Set[Tuple[int, int]],
+        attr_buffer: bytes,
+        all_lethal_attrs: Set[int],
+        willy_bottom_cell: int,
+    ) -> Set[Tuple[int, int]]:
+        """Remove fixed nasty cells that a jump arc cannot physically reach.
+
+        A nasty at (cx, cy) is ceiling-protected — and excluded from jump
+        blocking — only when BOTH conditions hold:
+          1. The cell immediately below it (cx, cy+1) is a solid non-lethal
+             platform tile (i.e. present in the attr buffer and not itself
+             lethal), AND
+          2. Willy's bottom cell is strictly below that platform
+             (willy_bottom_cell > cy+1), meaning the platform lies between
+             Willy and the nasty and the jump arc is stopped by the floor.
+
+        If Willy is already at or above the platform the nasty is reachable
+        and must not be filtered out.
+        """
+        accessible: Set[Tuple[int, int]] = set()
+        for cx, cy in fixed_lethal:
+            below_y = cy + 1
+            if below_y >= SCREEN_CELLS_H:
+                accessible.add((cx, cy))
+                continue
+            idx = below_y * SCREEN_CELLS_W + cx
+            if idx >= len(attr_buffer):
+                accessible.add((cx, cy))
+                continue
+            below_attr = int(attr_buffer[idx]) & 0x7F
+            if (below_attr != 0
+                    and below_attr not in all_lethal_attrs
+                    and willy_bottom_cell > below_y):
+                continue  # ceiling-protected: platform blocks the arc
+            accessible.add((cx, cy))
+        return accessible
+
     def _apply_safety_shield(
         self, state: ManicState, action: int, attr_buffer: Optional[bytes] = None
     ) -> Tuple[int, bool, str]:
@@ -249,8 +288,25 @@ class ManicPlayMixin:
             return action, False, ""
         if attr_buffer is None:
             attr_buffer = self._read_attr_buffer()
-        dynamic_lethal_cells = self._dynamic_lethal_cells_for_level(state.level, attr_buffer)
-        self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells)
+
+        # For jump actions, filter out fixed nasties that are on a platform
+        # ceiling the arc cannot physically reach.  Moving guardian cells are
+        # never filtered — their position changes during the arc.
+        if action in (3, 4, 5):
+            moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
+            moving_lethal = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
+            fixed_lethal = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
+            self._last_dynamic_lethal_cells_count = len(moving_lethal | fixed_lethal)
+            willy_bottom_cell = (state.willy_y_px + WILLY_SIZE_PX - 1) // CELL_SIZE_PX
+            all_lethal_attrs = moving_attrs | fixed_attrs
+            fixed_lethal = self._filter_ceiling_protected(
+                fixed_lethal, attr_buffer, all_lethal_attrs, willy_bottom_cell
+            )
+            dynamic_lethal_cells = moving_lethal | fixed_lethal
+        else:
+            dynamic_lethal_cells = self._dynamic_lethal_cells_for_level(state.level, attr_buffer)
+            self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells)
+
         if not self._action_hits_dynamic_lethal(state, action, dynamic_lethal_cells):
             return action, False, ""
         fallback = self._safe_fallback_action(state, action, dynamic_lethal_cells)
