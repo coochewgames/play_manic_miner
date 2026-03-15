@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 # Manic Miner memory locations
 AIR_HI_ADDR = 0x80BC
+AIR_SUPPLY_ADDR = 0x80BC   # same address — written to restore air to full
+AIR_SUPPLY_MAX  = 0x3F    # full air bar (range 0x24–0x3F; 0x24 = empty → life lost)
 LEVEL_ADDR = 0x8407
 LIVES_ADDR = 0x8457
 SCORE_ADDR = 0x8429
