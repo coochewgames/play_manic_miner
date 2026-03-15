@@ -271,6 +271,15 @@ class ManicDataMixin:
         return attrs
 
     def _parse_nasty_attrs(self, room: bytes) -> Set[int]:
+        """Return nasty attribute bytes that are actually placed in the cavern.
+
+        Each nasty type slot (NASTY1_OFFSET, NASTY2_OFFSET) is only counted as
+        lethal if its attribute byte appears in the cavern layout (the first
+        CAVERN_LAYOUT_SIZE bytes of room data).  Unused slots whose attribute
+        byte never appears on screen would otherwise generate false-positive
+        lethal detections across the whole attribute buffer.
+        """
+        layout = room[:CAVERN_LAYOUT_SIZE]
         attrs: Set[int] = set()
         for offset in (NASTY1_OFFSET, NASTY2_OFFSET):
             if offset >= len(room):
@@ -278,7 +287,9 @@ class ManicDataMixin:
             raw_attr = int(room[offset])
             if raw_attr in (0x00, 0xFF):
                 continue
-            attrs.add(raw_attr & 0x7F)
+            masked = raw_attr & 0x7F
+            if masked in layout:
+                attrs.add(masked)
         return attrs
 
     def _configured_lethal_attr_groups_for_level(self, level: int) -> Tuple[Set[int], Set[int]]:
