@@ -15,7 +15,7 @@ try:
 except ImportError:  # pragma: no cover
     import gym as gym  # type: ignore
 
-from manic_data import ManicDataMixin, ManicState, WILLY_AIRBORNE_ADDR
+from manic_data import ManicDataMixin, ManicState, WILLY_AIRBORNE_ADDR, AIR_SUPPLY_ADDR, AIR_SUPPLY_MAX
 from ml_client import FuseMLClient
 
 PLAY_MODULE_NAME = os.environ.get("MANIC_PLAY_MODULE", "manic_play")
@@ -23,6 +23,7 @@ _play_module = importlib.import_module(PLAY_MODULE_NAME)
 ManicPlayMixin = _play_module.ManicPlayMixin
 PATHING_NEW_CELL_REWARD = _play_module.PATHING_NEW_CELL_REWARD
 logger = logging.getLogger(__name__)
+
 
 ACTION_KEY_CHORDS: Dict[int, str] = {
     0: "-",
@@ -33,7 +34,6 @@ ACTION_KEY_CHORDS: Dict[int, str] = {
     5: "w+space",
 }
 
-WALK_FLIP_HYSTERESIS_STEPS = 2
 KEY_SCORE_INCREMENT = 100
 
 
@@ -53,9 +53,9 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         random_action_prob: float = 0.0,
         reset_random_action_steps: int = 8,
         first_key_mode: bool = False,
-        first_key_success_bonus: float = 120.0,
         safety_shield: bool = True,
         pathing_new_cell_reward: float = PATHING_NEW_CELL_REWARD,
+        infinite_air: bool = False,
     ):
         super().__init__()
         self.socket_path = socket_path
@@ -69,15 +69,15 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self.random_action_prob = float(np.clip(random_action_prob, 0.0, 1.0))
         self.reset_random_action_steps = max(0, int(reset_random_action_steps))
         self.first_key_mode = bool(first_key_mode)
-        self.first_key_success_bonus = float(first_key_success_bonus)
         self.safety_shield = bool(safety_shield)
         self.pathing_new_cell_reward = float(pathing_new_cell_reward)
+        self.infinite_air = bool(infinite_air)
 
         # 0=no-op, 1=left(q), 2=right(w), 3=jump(space), 4=jump-left, 5=jump-right.
         self.action_space = gym.spaces.Discrete(6)
         self.observation_space = gym.spaces.Box(
-            low=np.zeros(10, dtype=np.float32),
-            high=np.ones(10, dtype=np.float32),
+            low=np.zeros(13, dtype=np.float32),
+            high=np.ones(13, dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -86,19 +86,13 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         self.step_count = 0
         self.prev_state: Optional[ManicState] = None
-        self.keys_at_reset = 0
-        self.first_key_achieved = False
         self.visited_cells: Set[Tuple[int, int]] = set()
         self.configured_lethal_attrs_by_level: Dict[int, Set[int]] = {}
         self.configured_lethal_attr_groups_by_level: Dict[int, Tuple[Set[int], Set[int]]] = {}
-        self._rewarded_under_lethal_cells: Set[Tuple[int, int, int]] = set()
+        self._h_guardian_bounds_by_level: Dict[int, list] = {}
         self._last_dynamic_lethal_cells_count = 0
-        self._last_repeat_signature: Optional[Tuple[int, ...]] = None
-        self._repeat_signature_count = 0
         self._supports_episode_step_keys: Optional[bool] = None
         self._last_action_key_chord = "-"
-        self._last_action_used: Optional[int] = None
-        self._walk_flip_request_count = 0
         self._tracked_key_level: Optional[int] = None
         self._tracked_keys_remaining = 0
         self._tracked_key_score_anchor = 0
@@ -159,30 +153,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._last_action_key_chord = key_chord
         return episode
 
-    def _apply_walk_direction_hysteresis(self, action: int) -> Tuple[int, bool, str]:
-        if action not in (1, 2):
-            self._walk_flip_request_count = 0
-            return action, False, "-"
-        prev_action = self._last_action_used
-        if prev_action not in (1, 2):
-            self._walk_flip_request_count = 0
-            return action, False, "-"
-        if action == prev_action:
-            self._walk_flip_request_count = 0
-            return action, False, "-"
-
-        self._walk_flip_request_count += 1
-        if self._walk_flip_request_count < WALK_FLIP_HYSTERESIS_STEPS:
-            reason = (
-                f"walk_hysteresis_hold(prev={prev_action},requested={action},"
-                f"count={self._walk_flip_request_count})"
-            )
-            return int(prev_action), True, reason
-
-        self._walk_flip_request_count = 0
-        reason = f"walk_hysteresis_allow_flip(prev={prev_action},requested={action})"
-        return action, False, reason
-
     def _stabilize_keys_remaining(self, state: ManicState, force_reset: bool = False) -> None:
         configured = self._count_configured_items_for_level(state.level)
         life_lost = self.prev_state is not None and state.lives < self.prev_state.lives
@@ -195,12 +165,10 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         else:
             score_delta = int(state.score) - int(self._tracked_key_score_anchor)
             if score_delta >= KEY_SCORE_INCREMENT and self._tracked_keys_remaining > 0:
-                # At most one item can realistically be collected per env step.
                 collected = min(self._tracked_keys_remaining, score_delta // KEY_SCORE_INCREMENT, 1)
                 self._tracked_keys_remaining -= int(collected)
                 self._tracked_key_score_anchor += int(collected) * KEY_SCORE_INCREMENT
             elif score_delta < 0:
-                # Score should not normally go backwards; re-anchor if it does.
                 self._tracked_key_score_anchor = state.score
 
         state.keys_remaining = max(0, min(configured, int(self._tracked_keys_remaining)))
@@ -234,17 +202,10 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         state.coverage_ratio = self._coverage_ratio()
 
         self.prev_state = state
-        self.keys_at_reset = state.keys_remaining
-        self.first_key_achieved = False
         self.step_count = 0
-        self._last_repeat_signature = None
-        self._repeat_signature_count = 0
-        self._last_action_used = None
-        self._walk_flip_request_count = 0
         self._tracked_key_level = state.level
         self._tracked_keys_remaining = state.keys_remaining
         self._tracked_key_score_anchor = state.score
-        self._rewarded_under_lethal_cells.clear()
 
         info["state"] = state.__dict__.copy()
         info["first_key_mode"] = self.first_key_mode
@@ -261,23 +222,9 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         input_suppressed_for_airborne = self._is_airborne_status_active(airborne_status_before)
         attr_buffer_before = self._read_attr_buffer()
         safety_level = state_before.level
-        _, fixed_attrs = self._configured_lethal_attr_groups_for_level(safety_level)
-        fixed_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
-        dynamic_lethal_cells_before = self._dynamic_lethal_cells_for_level(safety_level, attr_buffer_before)
-        key_cells_before = self._active_item_cells_for_level(safety_level, attr_buffer_before)
-        self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells_before)
-        jump_above_blocked = False
-        jump_above_reason = "-"
-        local_jump_blocked = False
-        local_jump_forced = False
-        local_jump_reason = "-"
-        jump_gate_blocked = False
-        jump_gate_reason = "-"
-        walk_hysteresis_applied = False
-        walk_hysteresis_reason = "-"
         safety_blocked = False
         safety_reason = "-"
-        safety_overridden_by_jump_gate = False
+
         if input_suppressed_for_airborne:
             action_used = 0
             safety_reason = f"airborne_input_suppressed(status=0x{airborne_status_before:02X})"
@@ -285,68 +232,35 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             if self.random_action_prob > 0.0 and self._rng_random() < self.random_action_prob:
                 action_used = self._rng_integers(0, self.action_space.n)
                 random_action_applied = True
-            action_used, local_jump_blocked, local_jump_forced, local_jump_reason = self._apply_local_jump_rules(
-                state_before,
-                action_used,
-                fixed_lethal_cells_before,
-                dynamic_lethal_cells_before,
-                key_cells_before,
-            )
-            jump_above_blocked = "block_jump_up_fixed_above" in local_jump_reason
-            jump_above_reason = local_jump_reason
-            if not local_jump_forced:
-                action_used, jump_gate_blocked, jump_gate_reason = self._apply_directional_jump_gate(
-                    state_before, action_used, attr_buffer_before
-                )
-            else:
-                jump_gate_reason = "jump_gate_skipped_for_key_forced_jump"
 
-            action_used, walk_hysteresis_applied, walk_hysteresis_reason = self._apply_walk_direction_hysteresis(
-                action_used
-            )
-            action_used, safety_blocked, safety_reason = self._apply_safety_shield(
+            action_used, safety_blocked, safety_reason = self._select_safe_action(
                 state_before, action_used, attr_buffer_before
             )
 
-        # Jump is a one-shot input: send it for one frame only, then suppress inputs while airborne.
+        # Jump is a one-shot input: send for one frame only, then suppress
+        # inputs while Willy is airborne.
         if action_used in (3, 4, 5) or input_suppressed_for_airborne:
             frames_used = 1
 
         ep = self._episode_step_with_action(action_used, frames_used)
+        if self.infinite_air:
+            self.client.write_bytes(AIR_SUPPLY_ADDR, bytes([AIR_SUPPLY_MAX]))
         state = self._read_state()
         self._stabilize_keys_remaining(state)
-        attr_buffer_after = self._read_attr_buffer()
-        dynamic_lethal_cells_after = self._dynamic_lethal_cells_for_level(state.level, attr_buffer_after)
-        all_dynamic_lethal_cells = dynamic_lethal_cells_before | dynamic_lethal_cells_after
-        under_lethal_detected = int(self._is_under_lethal(state, all_dynamic_lethal_cells))
         airborne_status_after = self._read_u8(WILLY_AIRBORNE_ADDR)
+        is_airborne = self._is_airborne_status_active(airborne_status_after)
         life_lost_this_step = self.prev_state is not None and state.lives < self.prev_state.lives
 
-        first_key_achieved_now = state.keys_remaining < self.keys_at_reset
-        (
-            reward,
-            objective_reward,
-            hazard_reward,
-            pathing_reward,
-            repeat_penalty,
-            walk_reward,
-            under_lethal_reward,
-            repeat_detected,
-            repeat_count,
-            repeat_reason,
-            walk_reason,
-            under_lethal_reason,
-        ) = self._compute_reward(
-            state,
-            ep["reward"],
-            first_key_achieved_now,
-            action_used,
-            self._last_action_used,
-            dynamic_lethal_cells_after,
+        total, painting, frontier, key_reward, level_reward, life_penalty, key_approach = self._compute_reward(
+            state, self.prev_state, action_used, is_airborne=is_airborne
         )
-        if under_lethal_detected and under_lethal_reason == "-":
-            under_lethal_reason = "under_lethal_detected_no_reward"
+        if self.include_bridge_reward:
+            total += float(ep["reward"])
 
+        first_key_achieved_now = (
+            self.prev_state is not None
+            and state.keys_remaining < self.prev_state.keys_remaining
+        )
         bridge_done = bool(ep["done"])
         first_key_terminated = self.first_key_mode and first_key_achieved_now
         terminated = bridge_done or state.lives == 0 or first_key_terminated
@@ -369,49 +283,27 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             "input_suppressed_for_airborne": input_suppressed_for_airborne,
             "safety_shield": self.safety_shield,
             "safety_level": safety_level,
-            "jump_above_blocked": jump_above_blocked,
-            "jump_above_reason": jump_above_reason,
-            "local_jump_blocked": local_jump_blocked,
-            "local_jump_forced": local_jump_forced,
-            "local_jump_reason": local_jump_reason,
-            "jump_gate_blocked": jump_gate_blocked,
-            "jump_gate_reason": jump_gate_reason,
-            "walk_hysteresis_applied": walk_hysteresis_applied,
-            "walk_hysteresis_reason": walk_hysteresis_reason,
             "safety_blocked": safety_blocked,
             "safety_reason": safety_reason,
-            "safety_overridden_by_jump_gate": safety_overridden_by_jump_gate,
             "known_lethal_cells": self._last_dynamic_lethal_cells_count,
             "known_lethal_attrs": len(self._configured_lethal_attrs_for_level(safety_level)),
-            "fixed_lethal_cells": len(fixed_lethal_cells_before),
-            "visible_key_cells": len(key_cells_before),
             "life_lost_this_step": life_lost_this_step,
             "configured_keys_for_level": self._count_configured_items_for_level(state.level),
             "first_key_mode": self.first_key_mode,
             "first_key_achieved": first_key_achieved_now,
             "first_key_terminated": first_key_terminated,
-            "objective_reward": objective_reward,
-            "hazard_reward": hazard_reward,
-            "pathing_reward": pathing_reward,
-            "repeat_penalty": repeat_penalty,
-            "walk_reward": walk_reward,
-            "walk_reason": walk_reason,
-            "under_lethal_detected": under_lethal_detected,
-            "under_lethal_reward": under_lethal_reward,
-            "under_lethal_reason": under_lethal_reason,
-            "repeat_detected": repeat_detected,
-            "repeat_count": repeat_count,
-            "repeat_reason": repeat_reason,
+            "painting_reward": painting,
+            "frontier_reward": frontier,
+            "key_reward": key_reward,
+            "key_approach_reward": key_approach,
+            "level_reward": level_reward,
+            "life_penalty": life_penalty,
             "visited_cells": len(self.visited_cells),
             "exit_distance_px": self._distance_to_exit_px(state),
         }
 
-        if first_key_achieved_now:
-            self.first_key_achieved = True
-
-        self._last_action_used = int(action_used)
         self.prev_state = state
-        return self._normalize_observation(state.to_observation()), reward, terminated, truncated, info
+        return self._normalize_observation(state.to_observation()), total, terminated, truncated, info
 
     def close(self) -> None:
         self.client.close()

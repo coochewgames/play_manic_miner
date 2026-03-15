@@ -1,518 +1,396 @@
 #!/usr/bin/env python3
-"""Gameplay policy and reward-shaping logic for Manic Miner."""
+"""Gameplay policy and reward shaping for Manic Miner.
+
+Strategy
+--------
+* **Screen painting** — reward Willy for entering attribute cells not yet visited.
+* **Objectives** — reward key collection and level completion; penalise life loss.
+* **Safety blocking** — before executing any action, compute every attribute cell
+  that action will enter (walk: the cell immediately ahead; jump: the full arc)
+  and block the action if any of those cells currently hold a lethal attribute.
+  Fixed nasties and moving guardians are both detected via the attribute buffer.
+* **Guardian prediction** — for jump actions, moving guardian cells are dilated
+  horizontally by GUARDIAN_PREDICT_CELLS in each direction.  This accounts for
+  the guardian moving during the jump arc so the safety check reflects where the
+  guardian *will be*, not just where it *is* at the moment the jump is chosen.
+"""
 
 from __future__ import annotations
 
 from typing import Optional, Set, Tuple
 
-from manic_data import CELL_SIZE_PX, SCREEN_CELLS_W, WILLY_SIZE_PX, ManicState
+from manic_data import CELL_SIZE_PX, SCREEN_CELLS_H, SCREEN_CELLS_W, WILLY_SIZE_PX, ManicState
 
+# Rename exported name so manic_env.py can import it by the legacy alias.
+PATHING_NEW_CELL_REWARD = 2.0   # reward per new 8×8 attribute cell entered
+CELL_VISIT_REWARD = PATHING_NEW_CELL_REWARD
 
-# Objectives (positive)
-KEY_COLLECT_REWARD = 80.0
-LEVEL_COMPLETE_REWARD = 1000.0
-ALL_KEYS_CLEARED_REWARD = 250.0
-EXIT_APPROACH_REWARD_PER_PX = 0.08
+KEY_COLLECT_REWARD = 80.0       # reward per key collected
+LEVEL_COMPLETE_REWARD = 1000.0  # reward on completing a level
+# In first-key-mode the episode terminates on death, so missing the key reward
+# (80) is already the implicit cost.  An explicit penalty on top tips the
+# exploration-vs-safety balance against exploring and the agent learns to stand
+# still.  Set to 0 for first-key-mode; increase for full-game training where
+# the agent must learn to value its remaining lives.
+LIFE_LOSS_PENALTY = 0.0
 
-# Hazards (negative)
-LIFE_LOSS_PENALTY = 100.0
-AIR_DECAY_PENALTY_COEF = 0.0002
+# Set to 0 to disable; non-zero values add a small per-step cost.
+TIME_STEP_COST = 0.0
 
-# Pathing / anti-loop
-PATHING_NEW_CELL_REWARD = 2.0
-REPEAT_TRANSITION_TOLERANCE = 1
-REPEAT_TRANSITION_PENALTY = 1.0
-REPEAT_TRANSITION_PENALTY_MAX = 8.0
-WALK_PROGRESS_REWARD_PER_PX = 0.03
-WALK_STREAK_BONUS = 0.2
-WALK_DIRECTION_FLIP_PENALTY = 0.6
-WALK_NO_PROGRESS_PENALTY = 0.2
-WALK_UNDER_LETHAL_REWARD_PER_CELL = 0.6
-WALK_UNDER_LETHAL_VERTICAL_LOOKAHEAD_CELLS = 2
-WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS = 1
+# Set to 0 to disable the airborne step penalty.
+AIRBORNE_STEP_PENALTY = 0.0
 
-# Safety projection thresholds
-SAFETY_BLOCK_INTERSECTION_MIN_CELLS = 1
-SAFETY_JUMP_BLOCK_INTERSECTION_MIN_CELLS = 2
-SAFETY_WALK_LOOKAHEAD_PX = 2
+# Dense reward for moving closer to the nearest uncollected key.
+# Applied each grounded step where the Manhattan-pixel distance to the
+# nearest key decreases and no key was collected that step.
+KEY_APPROACH_REWARD_PER_PX = 0.2
+
+# Frontier bonus: reward per unvisited orthogonal neighbour of a newly entered
+# cell.  Creates a gradient toward unexplored areas — cells deep in unexplored
+# territory have more unvisited neighbours and therefore attract more reward.
+FRONTIER_REWARD_PER_NEIGHBOUR = 0.5
+
+# Jump arc: cumulative Y rise (px, upward positive) at each game frame of the arc.
+#
+# Derived from the assembly at 8ABB.  The y-coordinate at 0x8068 stores twice
+# the pixel y-position (1 unit = 0.5 px).  Each frame n (0–17) applies:
+#   delta_units = (n & 0xFE) - 8
+#   delta_px    = delta_units / 2   (negative = upward)
+# Cumulative rise per frame: 4,8,11,14,16,18,19,20 (peak),20,20,19,18,16,14,11,8,4,0
+# Peak = 20 px (2.5 attribute cells).  Confirmed by the disassembly annotations:
+#   frame 13 → 16 px above start (2 cell-heights) ✓
+#   frame 16 →  8 px above start (1 cell-height)  ✓
+#   frame 17 →  0 px            (landed)           ✓
+#
+# Horizontal movement: for directional jumps (4/5) Willy continues walking at
+# his normal rate throughout the arc — the direction key suppression in $806A
+# prevents *new* input, but existing lateral movement persists.  A value of 2
+# (px per game frame) matches Willy's walk speed and accurately sweeps the
+# cells he passes through.  Standing jump (action 3) uses h_sign=0 so this
+# constant has no effect on that arc.
 JUMP_PHASE_HORIZONTAL_PX = 2
-JUMP_PHASES_RISE_Y_PX = (4, 7, 9, 11, 12, 13, 14, 15, 16)
-JUMP_ARC_Y_FROM_START_PX = (
-    4,
-    7,
-    9,
-    11,
-    12,
-    13,
-    14,
-    15,
-    16,
-    15,
-    14,
-    13,
-    12,
-    11,
-    9,
-    7,
-    4,
-    0,
-)
+JUMP_ARC_Y_FROM_START_PX = (4, 8, 11, 14, 16, 18, 19, 20, 20, 20, 19, 18, 16, 14, 11, 8, 4, 0)
+
+# Minimum lethal-cell overlap count to block an action.
+WALK_LETHAL_BLOCK_MIN = 1
+JUMP_LETHAL_BLOCK_MIN = 1
+
+# Number of cells to expand moving guardian cells horizontally when checking
+# directional jump safety (actions 4/5).  Dilation is asymmetric: extended in
+# the guardian's current travel direction, with a 1-cell margin the other way.
+# A jump takes ~18 game frames; at ~2 px/frame a guardian moves ~4 attribute
+# cells.  4 gives a comfortable safety margin.
+GUARDIAN_PREDICT_CELLS = 4
+
+# For a standing jump (action 3) Willy's x-position is fixed for the full arc,
+# so the guardian can approach from *either* side and direction may reverse on a
+# boundary bounce.  Use a larger symmetric window.
+GUARDIAN_STANDING_JUMP_PREDICT_CELLS = 5
 
 
 class ManicPlayMixin:
-    """Methods that decide actions and calculate rewards."""
+    """Action selection (safety blocking) and reward computation."""
 
-    def _jump_arc_offsets(self, horizontal_sign: int) -> Tuple[Tuple[int, int], ...]:
-        offsets = []
-        for phase_idx, rise_px in enumerate(JUMP_ARC_Y_FROM_START_PX, start=1):
-            x_px = horizontal_sign * (phase_idx * JUMP_PHASE_HORIZONTAL_PX)
-            y_px = -rise_px
-            offsets.append((x_px, y_px))
-        return tuple(offsets)
+    # ------------------------------------------------------------------ #
+    # Jump arc geometry                                                    #
+    # ------------------------------------------------------------------ #
 
-    def _sample_offsets_for_action(self, action: int) -> Tuple[Tuple[int, int], ...]:
-        if action == 1:
-            return ((-SAFETY_WALK_LOOKAHEAD_PX, 0),)
-        if action == 2:
-            return ((SAFETY_WALK_LOOKAHEAD_PX, 0),)
-        if action == 3:
-            return tuple((0, -rise_px) for rise_px in JUMP_ARC_Y_FROM_START_PX)
-        if action == 4:
-            return self._jump_arc_offsets(-1)
-        if action == 5:
-            return self._jump_arc_offsets(1)
-        return ((0, 0),)
+    def _jump_arc_cells(self, state: ManicState, h_sign: int) -> Set[Tuple[int, int]]:
+        """All attribute cells Willy's sprite will occupy during a jump arc.
 
-    def _projected_cells_for_action(self, state: ManicState, action: int) -> Set[Tuple[int, int]]:
+        h_sign: -1 = jump-left, 0 = stand jump, +1 = jump-right.
+        """
         cells: Set[Tuple[int, int]] = set()
-        for dx_px, dy_px in self._sample_offsets_for_action(action):
-            x_px = max(0, min(255, state.willy_x_px + dx_px))
-            y_px = max(0, min(191, state.willy_y_px + dy_px))
-            cells.update(self._covered_cells(x_px, y_px))
+        for phase, rise_px in enumerate(JUMP_ARC_Y_FROM_START_PX, start=1):
+            x = max(0, min(255, state.willy_x_px + h_sign * phase * JUMP_PHASE_HORIZONTAL_PX))
+            y = max(0, min(191, state.willy_y_px - rise_px))
+            cells.update(self._covered_cells(x, y))
         return cells
 
-    def _apply_local_jump_rules(
+    # ------------------------------------------------------------------ #
+    # Safety blocking                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _dilate_cells_h(
+        self,
+        cells: Set[Tuple[int, int]],
+        n_left: int,
+        n_right: int,
+    ) -> Set[Tuple[int, int]]:
+        """Expand *cells* by *n_left* columns leftward and *n_right* rightward."""
+        dilated: Set[Tuple[int, int]] = set()
+        for cx, cy in cells:
+            for dx in range(-n_left, n_right + 1):
+                nx = cx + dx
+                if 0 <= nx < SCREEN_CELLS_W:
+                    dilated.add((nx, cy))
+        return dilated
+
+    def _cells_above_willy(self, state: ManicState, rows: int = 2) -> Set[Tuple[int, int]]:
+        """Attribute cells in the N rows directly above Willy's current position.
+
+        Checked explicitly before the arc for all jump actions, as a
+        belt-and-suspenders guard against arc sampling gaps.
+        """
+        x0 = max(0, state.willy_x_px // CELL_SIZE_PX)
+        x1 = min(SCREEN_CELLS_W - 1, (state.willy_x_px + WILLY_SIZE_PX - 1) // CELL_SIZE_PX)
+        y_top = state.willy_y_px // CELL_SIZE_PX
+        cells: Set[Tuple[int, int]] = set()
+        for dy in range(1, rows + 1):
+            y = y_top - dy
+            if y < 0:
+                break
+            for x in range(x0, x1 + 1):
+                cells.add((x, y))
+        return cells
+
+    def _filter_ceiling_protected(
+        self,
+        fixed_lethal: Set[Tuple[int, int]],
+        attr_buffer: bytes,
+        all_lethal_attrs: Set[int],
+        willy_bottom_cell: int,
+    ) -> Set[Tuple[int, int]]:
+        """Remove fixed lethal cells that are on a platform ceiling above Willy.
+
+        A nasty at (cx, cy) is ceiling-protected only when BOTH conditions hold:
+          1. The cell at (cx, cy+1) is a solid non-lethal platform tile, AND
+          2. Willy's bottom cell is strictly below that platform
+             (willy_bottom_cell > cy+1), so the platform physically lies between
+             Willy and the nasty and the jump arc is stopped before reaching it.
+
+        If Willy is already at or above the platform (e.g. standing on it), the
+        nasty is directly reachable and must not be filtered out.
+        """
+        accessible: Set[Tuple[int, int]] = set()
+        for cx, cy in fixed_lethal:
+            below_y = cy + 1
+            if below_y >= SCREEN_CELLS_H:
+                accessible.add((cx, cy))
+                continue
+            idx = below_y * SCREEN_CELLS_W + cx
+            if idx >= len(attr_buffer):
+                accessible.add((cx, cy))
+                continue
+            below_attr = int(attr_buffer[idx]) & 0x7F
+            if (below_attr != 0
+                    and below_attr not in all_lethal_attrs
+                    and willy_bottom_cell > below_y):
+                continue  # ceiling-protected — platform lies between Willy and nasty
+            accessible.add((cx, cy))
+        return accessible
+
+    def _action_is_safe(
         self,
         state: ManicState,
         action: int,
-        fixed_lethal_cells: Set[Tuple[int, int]],
-        any_lethal_cells: Set[Tuple[int, int]],
-        key_cells: Set[Tuple[int, int]],
-    ) -> Tuple[int, bool, bool, str]:
-        blocked_actions: Set[int] = set()
-        reasons = []
-
-        fixed_above = bool(self._cells_above_willy(state) & fixed_lethal_cells)
-        fixed_above_right = bool(self._cells_above_right_willy(state) & fixed_lethal_cells)
-        fixed_above_left = bool(self._cells_above_left_willy(state) & fixed_lethal_cells)
-        fixed_on_jump_arc_right = bool(self._projected_cells_for_action(state, 5) & fixed_lethal_cells)
-        fixed_on_jump_arc_left = bool(self._projected_cells_for_action(state, 4) & fixed_lethal_cells)
-        lethal_next_right = bool(self._front_cells_for_direction(state, 1) & any_lethal_cells)
-        lethal_next_left = bool(self._front_cells_for_direction(state, -1) & any_lethal_cells)
-        lethal_three_right = bool(self._cells_three_right_willy(state) & any_lethal_cells)
-        lethal_three_left = bool(self._cells_three_left_willy(state) & any_lethal_cells)
-
-        if fixed_above:
-            blocked_actions.add(3)
-            reasons.append("block_jump_up_fixed_above")
-        if fixed_above_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_fixed_above_right")
-        if fixed_above_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_fixed_above_left")
-        if fixed_on_jump_arc_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_fixed_on_arc")
-        if fixed_on_jump_arc_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_fixed_on_arc")
-        if lethal_next_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_any_lethal_next_right")
-        if lethal_next_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_any_lethal_next_left")
-        if lethal_three_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_any_lethal_three_right")
-        if lethal_three_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_any_lethal_three_left")
-
-        key_above_right = bool(self._cells_above_right_willy(state) & key_cells)
-        key_above_left = bool(self._cells_above_left_willy(state) & key_cells)
-        key_above = bool(self._cells_above_willy(state) & key_cells)
-
-        if key_above_right and 5 not in blocked_actions:
-            return 5, False, True, "force_jump_right_key_above_right"
-        if key_above_left and 4 not in blocked_actions:
-            return 4, False, True, "force_jump_left_key_above_left"
-        if key_above and 3 not in blocked_actions:
-            return 3, False, True, "force_jump_up_key_above"
-
-        if action in blocked_actions:
-            fallback = 0
-            if action == 4:
-                fallback = 1
-            elif action == 5:
-                fallback = 2
-            reason = ",".join(reasons) if reasons else "jump_block_local_rule"
-            return fallback, True, False, f"{reason}(action={action},fallback={fallback})"
-
-        return action, False, False, ""
-
-    def _apply_no_jump_if_lethal_above(
-        self, state: ManicState, action: int, dynamic_lethal_cells: Set[Tuple[int, int]]
-    ) -> Tuple[int, bool, str]:
-        if action not in (3, 4, 5):
-            return action, False, ""
-        if not dynamic_lethal_cells:
-            return action, False, ""
-        lethal_above = bool(self._cells_above_willy(state) & dynamic_lethal_cells)
-        if not lethal_above:
-            return action, False, ""
-        fallback = 0
-        if action == 4:
-            fallback = 1
-        elif action == 5:
-            fallback = 2
-        return fallback, True, f"jump_block_lethal_above(action={action},fallback={fallback})"
-
-    def _apply_directional_jump_gate(
-        self, state: ManicState, action: int, attr_buffer: bytes
-    ) -> Tuple[int, bool, str]:
-        if action not in (4, 5):
-            return action, False, ""
-
-        direction = -1 if action == 4 else 1
-        moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
-        moving_cells = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
-        fixed_cells = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
-        front_cells = self._front_cells_for_direction(state, direction)
-        fixed_ahead = bool(front_cells & fixed_cells)
-        moving_ahead = bool(front_cells & moving_cells)
-        explores_unvisited = bool(self._projected_cells_for_action(state, action) - self.visited_cells)
-
-        if fixed_ahead:
-            return action, False, "jump_gate_allow_fixed_ahead"
-        if moving_ahead:
-            return action, False, "jump_gate_allow_moving_ahead"
-        if explores_unvisited:
-            return action, False, "jump_gate_allow_explore_unvisited"
-
-        fallback = 1 if action == 4 else 2
-        return fallback, True, f"jump_gate_block(action={action},fallback={fallback})"
-
-    def _action_hits_dynamic_lethal(
-        self, state: ManicState, action: int, dynamic_lethal_cells: Set[Tuple[int, int]]
+        lethal_cells: Set[Tuple[int, int]],
     ) -> bool:
-        if action == 0:
-            return False
-        if not dynamic_lethal_cells:
-            return False
+        """Return True if *action* will not move Willy into a lethal cell."""
+        if not lethal_cells:
+            return True
         if action == 1:
-            overlap = self._front_cells_for_direction(state, -1) & dynamic_lethal_cells
-            return len(overlap) >= SAFETY_BLOCK_INTERSECTION_MIN_CELLS
+            front = self._front_cells_for_direction(state, -1)
+            return len(front & lethal_cells) < WALK_LETHAL_BLOCK_MIN
         if action == 2:
-            overlap = self._front_cells_for_direction(state, 1) & dynamic_lethal_cells
-            return len(overlap) >= SAFETY_BLOCK_INTERSECTION_MIN_CELLS
-        projected_cells = self._projected_cells_for_action(state, action)
-        overlap = projected_cells & dynamic_lethal_cells
-        return len(overlap) >= SAFETY_JUMP_BLOCK_INTERSECTION_MIN_CELLS
+            front = self._front_cells_for_direction(state, 1)
+            return len(front & lethal_cells) < WALK_LETHAL_BLOCK_MIN
+        if action in (3, 4, 5):
+            h_sign = 0 if action == 3 else (-1 if action == 4 else 1)
+            return len(self._jump_arc_cells(state, h_sign) & lethal_cells) < JUMP_LETHAL_BLOCK_MIN
+        return True  # no-op (0) is always safe
 
-    def _safe_fallback_action(
-        self, state: ManicState, blocked_action: int, dynamic_lethal_cells: Set[Tuple[int, int]]
+    def _guardian_sweep_cells(self, level: int) -> Set[Tuple[int, int]]:
+        """All attribute cells within each horizontal guardian's full patrol range.
+
+        Uses the guardian's left/right movement bounds from cavern ROM data —
+        exact, level-specific, and independent of the guardian's current position.
+        """
+        cells: Set[Tuple[int, int]] = set()
+        for g_y, g_x_left, g_x_right in self._h_guardian_bounds_for_level(level):
+            for x in range(g_x_left, g_x_right + 1):
+                cells.add((x, g_y))
+        return cells
+
+    def _lethal_cells_for_action(
+        self,
+        action: int,
+        fixed_lethal: Set[Tuple[int, int]],
+        moving_lethal: Set[Tuple[int, int]],
+        level: Optional[int] = None,
+    ) -> Set[Tuple[int, int]]:
+        """Return the lethal cell set appropriate for *action*.
+
+        Standing jump (3): symmetric dilation with GUARDIAN_STANDING_JUMP_PREDICT_CELLS.
+          Willy's x is fixed for the full arc, the guardian can approach from
+          either side, and may reverse on a boundary bounce — so direction is
+          irrelevant and a larger window is needed.
+
+        Directional jumps (4/5): asymmetric dilation with GUARDIAN_PREDICT_CELLS,
+          extended in the guardian's current travel direction with a 1-cell margin
+          the other way to catch boundary bounces.
+
+        Walk/no-op: actual current guardian positions only.
+        """
+        if action == 3 and moving_lethal:
+            n = GUARDIAN_STANDING_JUMP_PREDICT_CELLS
+            dilated = self._dilate_cells_h(moving_lethal, n, n)
+            return fixed_lethal | dilated
+
+        if action in (4, 5) and moving_lethal:
+            directions = self._read_h_guardian_directions()
+            any_right = any(d == "right" for d in directions)
+            any_left  = any(d == "left"  for d in directions)
+            if not directions:
+                n_left = n_right = GUARDIAN_PREDICT_CELLS
+            else:
+                n_right = GUARDIAN_PREDICT_CELLS if any_right else 1
+                n_left  = GUARDIAN_PREDICT_CELLS if any_left  else 1
+            dilated = self._dilate_cells_h(moving_lethal, n_left, n_right)
+            return fixed_lethal | dilated
+
+        return fixed_lethal | moving_lethal
+
+    def _safe_fallback(
+        self,
+        state: ManicState,
+        blocked: int,
+        fixed_lethal: Set[Tuple[int, int]],
+        moving_lethal: Set[Tuple[int, int]],
     ) -> int:
-        if blocked_action == 1:
-            candidates = [4, 3, 2, 0, 5, 1]
-        elif blocked_action == 2:
-            candidates = [5, 3, 1, 0, 4, 2]
-        elif blocked_action in (3, 4, 5):
-            candidates = [1, 2, 0]
+        """Find the best safe fallback when *blocked* action cannot be taken."""
+        if blocked == 4:
+            candidates = [1, 0]       # jump-left blocked → try walk-left, then no-op
+        elif blocked == 5:
+            candidates = [2, 0]       # jump-right blocked → try walk-right, then no-op
+        elif blocked == 3:
+            candidates = [0]          # stand-jump blocked → no-op
+        elif blocked == 1:
+            candidates = [0, 2]       # walk-left blocked → try no-op, walk-right
+        elif blocked == 2:
+            candidates = [0, 1]       # walk-right blocked → try no-op, walk-left
         else:
-            candidates = [0, 1, 2]
+            candidates = [0]
         for candidate in candidates:
-            if not self._action_hits_dynamic_lethal(state, candidate, dynamic_lethal_cells):
+            lethal = self._lethal_cells_for_action(candidate, fixed_lethal, moving_lethal, state.level)
+            if self._action_is_safe(state, candidate, lethal):
                 return candidate
         return 0
 
-    def _apply_safety_shield(
-        self, state: ManicState, action: int, attr_buffer: Optional[bytes] = None
+    def _select_safe_action(
+        self,
+        state: ManicState,
+        action: int,
+        attr_buffer: Optional[bytes] = None,
     ) -> Tuple[int, bool, str]:
+        """Apply attribute-based safety blocking for walk actions only.
+
+        Jump actions (3/4/5) are never blocked — the agent learns from those
+        outcomes directly.  Only walk-left (1) and walk-right (2) are blocked
+        to prevent trivially-avoidable ground-level nasty collisions.
+
+        Returns (action_used, was_blocked, reason_string).
+        """
         if not self.safety_shield:
             self._last_dynamic_lethal_cells_count = 0
             return action, False, ""
+
+        # Jumps are not blocked regardless of safety_shield setting.
+        if action not in (1, 2):
+            self._last_dynamic_lethal_cells_count = 0
+            return action, False, ""
+
         if attr_buffer is None:
             attr_buffer = self._read_attr_buffer()
-        dynamic_lethal_cells = self._dynamic_lethal_cells_for_level(state.level, attr_buffer)
-        self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells)
-        if not self._action_hits_dynamic_lethal(state, action, dynamic_lethal_cells):
+
+        moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
+        moving_lethal = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
+        fixed_lethal_raw = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
+        self._last_dynamic_lethal_cells_count = len(fixed_lethal_raw | moving_lethal)
+
+        action_lethal = fixed_lethal_raw | moving_lethal
+        if self._action_is_safe(state, action, action_lethal):
             return action, False, ""
-        fallback = self._safe_fallback_action(state, action, dynamic_lethal_cells)
-        return fallback, True, f"configured_lethal_block(action={action},fallback={fallback})"
 
-    def _objective_reward(
-        self,
-        state: ManicState,
-        prev_state: ManicState,
-        keys_collected: int,
-        level_delta: int,
-        first_key_achieved: bool,
-    ) -> float:
-        reward = 0.0
-        if keys_collected > 0:
-            reward += KEY_COLLECT_REWARD * float(keys_collected)
-        if level_delta > 0:
-            reward += LEVEL_COMPLETE_REWARD * float(level_delta)
-        if prev_state.keys_remaining > 0 and state.keys_remaining == 0:
-            reward += ALL_KEYS_CLEARED_REWARD
-        if prev_state.keys_remaining == 0 and state.keys_remaining == 0:
-            prev_distance = self._distance_to_exit_px(prev_state)
-            current_distance = self._distance_to_exit_px(state)
-            if prev_distance is not None and current_distance is not None:
-                distance_delta = prev_distance - current_distance
-                if distance_delta > 0:
-                    reward += EXIT_APPROACH_REWARD_PER_PX * distance_delta
-        if self.first_key_mode and first_key_achieved and not self.first_key_achieved:
-            reward += self.first_key_success_bonus
-        return reward
+        fallback = 0  # blocked walk → no-op; let the agent try a jump next step
+        return fallback, True, f"safety_block(action={action},fallback={fallback})"
 
-    def _hazard_reward(self, lives_delta: int, air_delta: int) -> float:
-        reward = 0.0
-        if lives_delta < 0:
-            reward += LIFE_LOSS_PENALTY * float(lives_delta)
-        if air_delta < 0:
-            reward += AIR_DECAY_PENALTY_COEF * float(air_delta)
-        return reward
+    # ------------------------------------------------------------------ #
+    # Reward                                                               #
+    # ------------------------------------------------------------------ #
 
-    def _pathing_reward(self, state: ManicState) -> float:
-        covered = self._covered_cells(state.willy_x_px, state.willy_y_px)
-        new_cells = covered - self.visited_cells
-        if new_cells:
-            self.visited_cells.update(new_cells)
-        return self.pathing_new_cell_reward * float(len(new_cells))
+    def _frontier_bonus(self, new_cells: Set[Tuple[int, int]]) -> float:
+        """Reward per unvisited orthogonal neighbour of each newly entered cell.
 
-    def _repeat_transition_penalty(
-        self,
-        prev_state: Optional[ManicState],
-        state: ManicState,
-        action_used: int,
-        pathing_reward: float,
-    ) -> Tuple[float, bool, int, str]:
-        if prev_state is None:
-            self._last_repeat_signature = None
-            self._repeat_signature_count = 0
-            return 0.0, False, 0, "-"
-
-        prev_cell = (prev_state.willy_x_px // CELL_SIZE_PX, prev_state.willy_y_px // CELL_SIZE_PX)
-        curr_cell = (state.willy_x_px // CELL_SIZE_PX, state.willy_y_px // CELL_SIZE_PX)
-        no_outcome_change = (
-            state.level == prev_state.level
-            and state.lives == prev_state.lives
-            and state.keys_remaining == prev_state.keys_remaining
-            and state.score == prev_state.score
-        )
-        no_progress = (prev_cell == curr_cell) and no_outcome_change and (pathing_reward <= 0.0)
-        if not no_progress:
-            self._last_repeat_signature = None
-            self._repeat_signature_count = 0
-            return 0.0, False, 0, "-"
-
-        signature = (
-            prev_cell[0],
-            prev_cell[1],
-            int(action_used),
-            curr_cell[0],
-            curr_cell[1],
-            state.level,
-            state.lives,
-            state.keys_remaining,
-            state.score,
-        )
-        if signature == self._last_repeat_signature:
-            self._repeat_signature_count += 1
-        else:
-            self._last_repeat_signature = signature
-            self._repeat_signature_count = 1
-
-        repeats_over_tolerance = max(0, self._repeat_signature_count - REPEAT_TRANSITION_TOLERANCE)
-        if repeats_over_tolerance <= 0:
-            return 0.0, True, self._repeat_signature_count, "repeat_transition_warmup"
-
-        penalty = -min(
-            REPEAT_TRANSITION_PENALTY * float(repeats_over_tolerance),
-            REPEAT_TRANSITION_PENALTY_MAX,
-        )
-        reason = f"repeat_transition(count={self._repeat_signature_count},action={action_used})"
-        return penalty, True, self._repeat_signature_count, reason
-
-    def _walk_behavior_reward(
-        self,
-        prev_state: Optional[ManicState],
-        state: ManicState,
-        action_used: int,
-        prev_action_used: Optional[int],
-    ) -> Tuple[float, str]:
-        if prev_state is None:
-            return 0.0, "-"
-        if action_used not in (1, 2):
-            return 0.0, "-"
-
-        x_delta = state.willy_x_px - prev_state.willy_x_px
-        expected_sign = -1 if action_used == 1 else 1
-        moved_in_expected_direction = x_delta * expected_sign > 0
-
-        reward = 0.0
-        reasons = []
-        if moved_in_expected_direction:
-            progress_px = abs(x_delta)
-            reward += WALK_PROGRESS_REWARD_PER_PX * float(progress_px)
-            reasons.append(f"walk_progress_px={progress_px}")
-            if prev_action_used == action_used:
-                reward += WALK_STREAK_BONUS
-                reasons.append("walk_streak")
-        else:
-            reward -= WALK_NO_PROGRESS_PENALTY
-            reasons.append("walk_no_progress")
-
-        if prev_action_used in (1, 2) and prev_action_used != action_used:
-            reward -= WALK_DIRECTION_FLIP_PENALTY
-            reasons.append("walk_direction_flip")
-
-        if not reasons:
-            return reward, "-"
-        return reward, ",".join(reasons)
-
-    def _under_lethal_overlap_cells(
-        self, state: ManicState, dynamic_lethal_cells: Set[Tuple[int, int]]
-    ) -> Set[Tuple[int, int]]:
-        if not dynamic_lethal_cells:
-            return set()
-        x0 = max(0, min(SCREEN_CELLS_W - 1, state.willy_x_px // CELL_SIZE_PX))
-        x1 = max(0, min(SCREEN_CELLS_W - 1, (state.willy_x_px + WILLY_SIZE_PX - 1) // CELL_SIZE_PX))
-        y_top = max(0, state.willy_y_px // CELL_SIZE_PX)
-        left_x = max(0, x0 - WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS)
-        right_x = min(SCREEN_CELLS_W - 1, x1 + WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS)
-        overlap: Set[Tuple[int, int]] = set()
-        for x_cell in range(left_x, right_x + 1):
-            for dy in range(0, WALK_UNDER_LETHAL_VERTICAL_LOOKAHEAD_CELLS + 1):
-                y_cell = y_top - dy
-                if y_cell < 0:
-                    break
-                cell = (x_cell, y_cell)
-                if cell in dynamic_lethal_cells:
-                    overlap.add(cell)
-        return overlap
-
-    def _is_under_lethal(self, state: ManicState, dynamic_lethal_cells: Set[Tuple[int, int]]) -> bool:
-        return bool(self._under_lethal_overlap_cells(state, dynamic_lethal_cells))
-
-    def _walk_under_lethal_reward(
-        self,
-        prev_state: Optional[ManicState],
-        state: ManicState,
-        action_used: int,
-        dynamic_lethal_cells: Set[Tuple[int, int]],
-    ) -> Tuple[float, str]:
-        if prev_state is None:
-            return 0.0, "-"
-        if action_used not in (1, 2):
-            return 0.0, "-"
-        if not dynamic_lethal_cells:
-            return 0.0, "-"
-
-        x_delta = state.willy_x_px - prev_state.willy_x_px
-        expected_sign = -1 if action_used == 1 else 1
-        if x_delta * expected_sign <= 0:
-            return 0.0, "-"
-
-        overhead = self._under_lethal_overlap_cells(state, dynamic_lethal_cells)
-        if not overhead:
-            return 0.0, "-"
-
-        newly_rewarded = 0
-        for x_cell, y_cell in overhead:
-            key = (state.level, x_cell, y_cell)
-            if key in self._rewarded_under_lethal_cells:
-                continue
-            self._rewarded_under_lethal_cells.add(key)
-            newly_rewarded += 1
-
-        if newly_rewarded <= 0:
-            return 0.0, "-"
-        reward = WALK_UNDER_LETHAL_REWARD_PER_CELL * float(newly_rewarded)
-        reason = f"walk_under_lethal_new_cells={newly_rewarded},overhead_cells={len(overhead)}"
-        return reward, reason
+        Called after visited_cells has been updated, so neighbours still absent
+        from visited_cells are genuinely unexplored.
+        """
+        bonus = 0.0
+        for cx, cy in new_cells:
+            for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                if 0 <= nx < SCREEN_CELLS_W and 0 <= ny < SCREEN_CELLS_H:
+                    if (nx, ny) not in self.visited_cells:
+                        bonus += FRONTIER_REWARD_PER_NEIGHBOUR
+        return bonus
 
     def _compute_reward(
         self,
         state: ManicState,
-        bridge_reward: int,
-        first_key_achieved: bool,
+        prev_state: Optional[ManicState],
         action_used: int,
-        prev_action_used: Optional[int],
-        dynamic_lethal_cells: Set[Tuple[int, int]],
-    ) -> Tuple[float, float, float, float, float, float, float, bool, int, str, str, str]:
-        if self.prev_state is None:
-            objective = 0.0
-            hazards = 0.0
-        else:
-            lives_delta = state.lives - self.prev_state.lives
-            level_delta = state.level - self.prev_state.level
-            air_delta = state.air - self.prev_state.air
-            keys_collected = max(0, self.prev_state.keys_remaining - state.keys_remaining)
+        is_airborne: bool = False,
+    ) -> Tuple[float, float, float, float, float, float, float]:
+        """Compute step reward.
 
-            # 1) Objectives: positive rewards for game goals.
-            objective = self._objective_reward(
-                state,
-                self.prev_state,
-                keys_collected,
-                level_delta,
-                first_key_achieved,
-            )
+        Returns (total, painting, frontier, key_reward, level_reward, life_penalty, key_approach).
+        life_penalty is a positive magnitude; it is *subtracted* from total.
 
-            # 2) Hazards: negative rewards for dangerous outcomes.
-            hazards = self._hazard_reward(lives_delta, air_delta)
+        Painting and frontier are suppressed while Willy is airborne so that
+        cells along the jump arc are not counted — only cells visited on the
+        ground count.  This removes the large exploration incentive for jumping.
 
-        # 3) Pathing: positive reward for unique area coverage.
-        pathing = self._pathing_reward(state)
-
-        repeat_penalty, repeat_detected, repeat_count, repeat_reason = self._repeat_transition_penalty(
-            self.prev_state,
-            state,
-            action_used,
-            pathing,
-        )
-        walk_reward, walk_reason = self._walk_behavior_reward(
-            self.prev_state,
-            state,
-            action_used,
-            prev_action_used,
-        )
-        under_lethal_reward, under_lethal_reason = self._walk_under_lethal_reward(
-            self.prev_state,
-            state,
-            action_used,
-            dynamic_lethal_cells,
-        )
-
-        reward = objective + hazards + pathing + repeat_penalty + walk_reward + under_lethal_reward
-        if self.include_bridge_reward:
-            reward += float(bridge_reward)
-
+        key_approach is a dense reward for reducing the Manhattan-pixel distance
+        to the nearest uncollected key while grounded and no key was collected.
+        """
         state.coverage_ratio = self._coverage_ratio()
-        return (
-            reward,
-            objective,
-            hazards,
-            pathing,
-            repeat_penalty,
-            walk_reward,
-            under_lethal_reward,
-            repeat_detected,
-            repeat_count,
-            repeat_reason,
-            walk_reason,
-            under_lethal_reason,
-        )
+        if is_airborne:
+            painting = 0.0
+            frontier = 0.0
+            airborne_penalty = AIRBORNE_STEP_PENALTY
+        else:
+            airborne_penalty = 0.0
+            covered = self._covered_cells(state.willy_x_px, state.willy_y_px)
+            new_cells = covered - self.visited_cells
+            self.visited_cells.update(new_cells)
+            state.coverage_ratio = self._coverage_ratio()
+            painting = self.pathing_new_cell_reward * float(len(new_cells))
+            frontier = self._frontier_bonus(new_cells)
+
+        step_cost = TIME_STEP_COST
+
+        if prev_state is None:
+            return painting + frontier - airborne_penalty - step_cost, painting, frontier, 0.0, 0.0, 0.0, 0.0
+
+        keys_collected = max(0, prev_state.keys_remaining - state.keys_remaining)
+        key_reward = KEY_COLLECT_REWARD * float(keys_collected)
+
+        level_delta = max(0, state.level - prev_state.level)
+        level_reward = LEVEL_COMPLETE_REWARD * float(level_delta)
+
+        lives_delta = min(0, state.lives - prev_state.lives)
+        life_penalty = LIFE_LOSS_PENALTY * float(-lives_delta)
+
+        # Dense approach reward: reward each pixel of progress toward the
+        # nearest key while grounded.  Only when keys_remaining is unchanged
+        # (no collection this step — key_reward already covers that case).
+        key_approach = 0.0
+        if (not is_airborne
+                and keys_collected == 0
+                and state.keys_remaining > 0
+                and state.keys_remaining == prev_state.keys_remaining):
+            prev_dist = abs(prev_state.nearest_key_dx_px) + abs(prev_state.nearest_key_dy_px)
+            curr_dist = abs(state.nearest_key_dx_px) + abs(state.nearest_key_dy_px)
+            key_approach = KEY_APPROACH_REWARD_PER_PX * max(0.0, float(prev_dist - curr_dist))
+
+        total = painting + frontier + key_reward + level_reward + key_approach - life_penalty - airborne_penalty - step_cost
+        return total, painting, frontier, key_reward, level_reward, life_penalty, key_approach

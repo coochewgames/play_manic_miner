@@ -74,6 +74,9 @@ class FuseMLClient:
             raise RuntimeError(f"Unexpected READ response: {' '.join(parts)!r}")
         return bytes.fromhex(parts[1])
 
+    def write_bytes(self, address: int, data: bytes) -> None:
+        self.cmd(f"WRITE {address} {data.hex()}")
+
     def episode_step(self, action: int, frames: int, auto_reset: int = 0) -> Dict[str, int]:
         parts = self.cmd(f"EPISODE_STEP {action} {frames} {auto_reset}").split()
         # EPISODE <frame_count> <tstates> <width> <height> <reward> <done> <reset>
