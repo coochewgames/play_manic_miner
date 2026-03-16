@@ -28,6 +28,7 @@ WALK_STREAK_BONUS = 0.2
 WALK_DIRECTION_FLIP_PENALTY = 0.6
 WALK_NO_PROGRESS_PENALTY = 0.2
 WALK_UNDER_LETHAL_REWARD_PER_CELL = 0.6
+JUMP_UNDER_LETHAL_PENALTY = 1.2
 WALK_UNDER_LETHAL_VERTICAL_LOOKAHEAD_CELLS = 2
 WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS = 1
 
@@ -102,6 +103,7 @@ class ManicPlayMixin:
         fixed_lethal_cells: Set[Tuple[int, int]],
         any_lethal_cells: Set[Tuple[int, int]],
         key_cells: Set[Tuple[int, int]],
+        moving_lethal_cells: Optional[Set[Tuple[int, int]]] = None,
     ) -> Tuple[int, bool, bool, str]:
         blocked_actions: Set[int] = set()
         reasons = []
@@ -113,8 +115,12 @@ class ManicPlayMixin:
         fixed_on_jump_arc_left = bool(self._projected_cells_for_action(state, 4) & fixed_lethal_cells)
         lethal_next_right = bool(self._front_cells_for_direction(state, 1) & any_lethal_cells)
         lethal_next_left = bool(self._front_cells_for_direction(state, -1) & any_lethal_cells)
-        lethal_three_right = bool(self._cells_three_right_willy(state) & any_lethal_cells)
-        lethal_three_left = bool(self._cells_three_left_willy(state) & any_lethal_cells)
+        # Arc checks combine ceiling-filtered fixed nasties (reachable by the arc)
+        # with moving guardian cells.  Unreachable (ceiling-protected) nasties are
+        # already absent from fixed_lethal_cells so they won't block unnecessarily.
+        arc_lethal_cells = fixed_lethal_cells | (moving_lethal_cells if moving_lethal_cells is not None else any_lethal_cells)
+        dynamic_on_jump_arc_right = bool(self._projected_cells_for_action(state, 5) & arc_lethal_cells)
+        dynamic_on_jump_arc_left = bool(self._projected_cells_for_action(state, 4) & arc_lethal_cells)
 
         if fixed_above:
             blocked_actions.add(3)
@@ -137,12 +143,12 @@ class ManicPlayMixin:
         if lethal_next_left:
             blocked_actions.add(4)
             reasons.append("block_jump_left_any_lethal_next_left")
-        if lethal_three_right:
+        if dynamic_on_jump_arc_right:
             blocked_actions.add(5)
-            reasons.append("block_jump_right_any_lethal_three_right")
-        if lethal_three_left:
+            reasons.append("block_jump_right_dynamic_on_arc")
+        if dynamic_on_jump_arc_left:
             blocked_actions.add(4)
-            reasons.append("block_jump_left_any_lethal_three_left")
+            reasons.append("block_jump_left_dynamic_on_arc")
 
         key_above_right = bool(self._cells_above_right_willy(state) & key_cells)
         key_above_left = bool(self._cells_above_left_willy(state) & key_cells)
@@ -165,23 +171,6 @@ class ManicPlayMixin:
             return fallback, True, False, f"{reason}(action={action},fallback={fallback})"
 
         return action, False, False, ""
-
-    def _apply_no_jump_if_lethal_above(
-        self, state: ManicState, action: int, dynamic_lethal_cells: Set[Tuple[int, int]]
-    ) -> Tuple[int, bool, str]:
-        if action not in (3, 4, 5):
-            return action, False, ""
-        if not dynamic_lethal_cells:
-            return action, False, ""
-        lethal_above = bool(self._cells_above_willy(state) & dynamic_lethal_cells)
-        if not lethal_above:
-            return action, False, ""
-        fallback = 0
-        if action == 4:
-            fallback = 1
-        elif action == 5:
-            fallback = 2
-        return fallback, True, f"jump_block_lethal_above(action={action},fallback={fallback})"
 
     def _apply_directional_jump_gate(
         self, state: ManicState, action: int, attr_buffer: bytes
@@ -246,7 +235,7 @@ class ManicPlayMixin:
         fixed_lethal: Set[Tuple[int, int]],
         attr_buffer: bytes,
         all_lethal_attrs: Set[int],
-        willy_bottom_cell: int,
+        willy_top_cell: int,
     ) -> Set[Tuple[int, int]]:
         """Remove fixed nasty cells that a jump arc cannot physically reach.
 
@@ -255,12 +244,12 @@ class ManicPlayMixin:
           1. The cell immediately below it (cx, cy+1) is a solid non-lethal
              platform tile (i.e. present in the attr buffer and not itself
              lethal), AND
-          2. Willy's bottom cell is strictly below that platform
-             (willy_bottom_cell > cy+1), meaning the platform lies between
-             Willy and the nasty and the jump arc is stopped by the floor.
+          2. Willy's TOP cell is strictly below that platform
+             (willy_top_cell > cy+1), meaning the platform is above Willy's
+             head and will stop the jump arc before it reaches the nasty.
 
-        If Willy is already at or above the platform the nasty is reachable
-        and must not be filtered out.
+        If Willy's top is at or above the platform cell the jump starts from
+        that level and the nasty is reachable; it must not be filtered out.
         """
         accessible: Set[Tuple[int, int]] = set()
         for cx, cy in fixed_lethal:
@@ -275,7 +264,7 @@ class ManicPlayMixin:
             below_attr = int(attr_buffer[idx]) & 0x7F
             if (below_attr != 0
                     and below_attr not in all_lethal_attrs
-                    and willy_bottom_cell > below_y):
+                    and willy_top_cell > below_y):
                 continue  # ceiling-protected: platform blocks the arc
             accessible.add((cx, cy))
         return accessible
@@ -297,10 +286,10 @@ class ManicPlayMixin:
             moving_lethal = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
             fixed_lethal = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
             self._last_dynamic_lethal_cells_count = len(moving_lethal | fixed_lethal)
-            willy_bottom_cell = (state.willy_y_px + WILLY_SIZE_PX - 1) // CELL_SIZE_PX
+            willy_top_cell = state.willy_y_px // CELL_SIZE_PX
             all_lethal_attrs = moving_attrs | fixed_attrs
             fixed_lethal = self._filter_ceiling_protected(
-                fixed_lethal, attr_buffer, all_lethal_attrs, willy_bottom_cell
+                fixed_lethal, attr_buffer, all_lethal_attrs, willy_top_cell
             )
             dynamic_lethal_cells = moving_lethal | fixed_lethal
         else:
@@ -505,6 +494,19 @@ class ManicPlayMixin:
         reason = f"walk_under_lethal_new_cells={newly_rewarded},overhead_cells={len(overhead)}"
         return reward, reason
 
+    def _jump_under_lethal_penalty(
+        self,
+        state: ManicState,
+        action_used: int,
+        dynamic_lethal_cells: Set[Tuple[int, int]],
+    ) -> Tuple[float, str]:
+        if action_used not in (3, 4, 5):
+            return 0.0, "-"
+        overhead = self._under_lethal_overlap_cells(state, dynamic_lethal_cells)
+        if not overhead:
+            return 0.0, "-"
+        return -JUMP_UNDER_LETHAL_PENALTY, f"jump_under_lethal_penalty,overhead_cells={len(overhead)}"
+
     def _compute_reward(
         self,
         state: ManicState,
@@ -556,6 +558,17 @@ class ManicPlayMixin:
             action_used,
             dynamic_lethal_cells,
         )
+        jump_lethal_penalty, jump_lethal_reason = self._jump_under_lethal_penalty(
+            state,
+            action_used,
+            dynamic_lethal_cells,
+        )
+        under_lethal_reward += jump_lethal_penalty
+        if jump_lethal_reason != "-":
+            under_lethal_reason = (
+                jump_lethal_reason if under_lethal_reason == "-"
+                else f"{under_lethal_reason},{jump_lethal_reason}"
+            )
 
         reward = objective + hazards + pathing + repeat_penalty + walk_reward + under_lethal_reward
         if self.include_bridge_reward:

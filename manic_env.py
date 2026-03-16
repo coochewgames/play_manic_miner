@@ -15,7 +15,10 @@ try:
 except ImportError:  # pragma: no cover
     import gym as gym  # type: ignore
 
-from manic_data import ManicDataMixin, ManicState, WILLY_AIRBORNE_ADDR, AIR_SUPPLY_ADDR, AIR_SUPPLY_MAX
+from manic_data import (
+    ManicDataMixin, ManicState, WILLY_AIRBORNE_ADDR, AIR_SUPPLY_ADDR, AIR_SUPPLY_MAX,
+    CELL_SIZE_PX, WILLY_SIZE_PX, SCREEN_CELLS_W, SCREEN_CELLS_H,
+)
 from ml_client import FuseMLClient
 
 PLAY_MODULE_NAME = os.environ.get("MANIC_PLAY_MODULE", "manic_play")
@@ -77,9 +80,13 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         # 0=no-op, 1=left(q), 2=right(w), 3=jump(space), 4=jump-left, 5=jump-right.
         self.action_space = gym.spaces.Discrete(6)
+        # 10 base features + 12 entity features + 3 exploration features:
+        #   guardian (dx, dy, dist), nasty (dx, dy, dist), key (dx, dy, dist),
+        #   lethal_overhead, lethal_left, lethal_right,
+        #   nearest_unvisited (dx, dy, dist)
         self.observation_space = gym.spaces.Box(
-            low=np.zeros(10, dtype=np.float32),
-            high=np.ones(10, dtype=np.float32),
+            low=np.zeros(25, dtype=np.float32),
+            high=np.ones(25, dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -208,6 +215,93 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         state.keys_remaining = max(0, min(configured, int(self._tracked_keys_remaining)))
         state.portal_open = 1 if state.keys_remaining == 0 else 0
 
+    def _nearest_entity_features(
+        self, willy_x_px: int, willy_y_px: int, entity_cells: Set[Tuple[int, int]]
+    ) -> Tuple[float, float, float]:
+        """Return (dx_norm, dy_norm, dist_norm) to the nearest cell in entity_cells.
+
+        All values are normalised to [0, 1].  dx/dy are centred at 0.5
+        (0.5 = same position, <0.5 = entity is to the left/above).
+        dist is 0.0 when on top of the entity, 1.0 at maximum screen distance.
+        If entity_cells is empty, returns (0.5, 0.5, 1.0) — no information.
+        """
+        if not entity_cells:
+            return 0.5, 0.5, 1.0
+        willy_cx = willy_x_px // CELL_SIZE_PX
+        willy_cy = willy_y_px // CELL_SIZE_PX
+        best_dist = float("inf")
+        best_dx = 0.0
+        best_dy = 0.0
+        for ex, ey in entity_cells:
+            dx = ex - willy_cx
+            dy = ey - willy_cy
+            dist = abs(dx) + abs(dy)
+            if dist < best_dist:
+                best_dist = dist
+                best_dx = float(dx)
+                best_dy = float(dy)
+        dx_norm = float(np.clip((best_dx + SCREEN_CELLS_W) / (2.0 * SCREEN_CELLS_W), 0.0, 1.0))
+        dy_norm = float(np.clip((best_dy + SCREEN_CELLS_H) / (2.0 * SCREEN_CELLS_H), 0.0, 1.0))
+        dist_norm = float(np.clip(best_dist / (SCREEN_CELLS_W + SCREEN_CELLS_H), 0.0, 1.0))
+        return dx_norm, dy_norm, dist_norm
+
+    def _nearest_unvisited_features(self, willy_x_px: int, willy_y_px: int) -> Tuple[float, float, float]:
+        """Return (dx_norm, dy_norm, dist_norm) to the nearest unvisited cell.
+
+        Uses the same normalisation convention as _nearest_entity_features.
+        If the screen is fully visited, returns (0.5, 0.5, 0.0).
+        """
+        willy_cx = willy_x_px // CELL_SIZE_PX
+        willy_cy = willy_y_px // CELL_SIZE_PX
+        best_dist = float("inf")
+        best_dx = 0.0
+        best_dy = 0.0
+        for cx in range(SCREEN_CELLS_W):
+            for cy in range(SCREEN_CELLS_H):
+                if (cx, cy) not in self.visited_cells:
+                    dx = cx - willy_cx
+                    dy = cy - willy_cy
+                    dist = abs(dx) + abs(dy)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_dx = float(dx)
+                        best_dy = float(dy)
+        if best_dist == float("inf"):
+            return 0.5, 0.5, 0.0  # fully explored
+        dx_norm = float(np.clip((best_dx + SCREEN_CELLS_W) / (2.0 * SCREEN_CELLS_W), 0.0, 1.0))
+        dy_norm = float(np.clip((best_dy + SCREEN_CELLS_H) / (2.0 * SCREEN_CELLS_H), 0.0, 1.0))
+        dist_norm = float(np.clip(best_dist / (SCREEN_CELLS_W + SCREEN_CELLS_H), 0.0, 1.0))
+        return dx_norm, dy_norm, dist_norm
+
+    def _build_observation(self, state: ManicState, attr_buffer: bytes) -> np.ndarray:
+        """Build the full 22-feature observation for the current state."""
+        base_obs = self._normalize_observation(state.to_observation())
+
+        moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
+        guardian_cells = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
+        nasty_cells = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
+        key_cells = self._active_item_cells_for_level(state.level, attr_buffer)
+        all_lethal_cells = guardian_cells | nasty_cells
+
+        wx, wy = state.willy_x_px, state.willy_y_px
+        g_dx, g_dy, g_dist = self._nearest_entity_features(wx, wy, guardian_cells)
+        n_dx, n_dy, n_dist = self._nearest_entity_features(wx, wy, nasty_cells)
+        k_dx, k_dy, k_dist = self._nearest_entity_features(wx, wy, key_cells)
+
+        lethal_overhead = 1.0 if self._is_under_lethal(state, all_lethal_cells) else 0.0
+        lethal_left = 1.0 if bool(self._front_cells_for_direction(state, -1) & all_lethal_cells) else 0.0
+        lethal_right = 1.0 if bool(self._front_cells_for_direction(state, 1) & all_lethal_cells) else 0.0
+
+        uv_dx, uv_dy, uv_dist = self._nearest_unvisited_features(state.willy_x_px, state.willy_y_px)
+
+        entity_obs = np.array(
+            [g_dx, g_dy, g_dist, n_dx, n_dy, n_dist, k_dx, k_dy, k_dist,
+             lethal_overhead, lethal_left, lethal_right,
+             uv_dx, uv_dy, uv_dist],
+            dtype=np.float32,
+        )
+        return np.concatenate([base_obs, entity_obs])
+
     def reset(
         self,
         *,
@@ -230,6 +324,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         state = self._read_state()
         self._stabilize_keys_remaining(state, force_reset=True)
         info = self.client.get_info()
+        attr_buffer = self._read_attr_buffer()
 
         self.visited_cells.clear()
         self.visited_cells.update(self._covered_cells(state.willy_x_px, state.willy_y_px))
@@ -250,7 +345,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         info["state"] = state.__dict__.copy()
         info["first_key_mode"] = self.first_key_mode
-        return self._normalize_observation(state.to_observation()), info
+        return self._build_observation(state, attr_buffer), info
 
     def step(self, action: int):
         self.step_count += 1
@@ -263,9 +358,14 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         input_suppressed_for_airborne = self._is_airborne_status_active(airborne_status_before)
         attr_buffer_before = self._read_attr_buffer()
         safety_level = state_before.level
-        _, fixed_attrs = self._configured_lethal_attr_groups_for_level(safety_level)
+        moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(safety_level)
         fixed_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
-        dynamic_lethal_cells_before = self._dynamic_lethal_cells_for_level(safety_level, attr_buffer_before)
+        willy_top_cell = state_before.willy_y_px // CELL_SIZE_PX
+        fixed_lethal_cells_before = self._filter_ceiling_protected(
+            fixed_lethal_cells_before, attr_buffer_before, moving_attrs | fixed_attrs, willy_top_cell
+        )
+        moving_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, moving_attrs)
+        dynamic_lethal_cells_before = moving_lethal_cells_before | self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
         key_cells_before = self._active_item_cells_for_level(safety_level, attr_buffer_before)
         self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells_before)
         jump_above_blocked = False
@@ -293,6 +393,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
                 fixed_lethal_cells_before,
                 dynamic_lethal_cells_before,
                 key_cells_before,
+                moving_lethal_cells_before,
             )
             jump_above_blocked = "block_jump_up_fixed_above" in local_jump_reason
             jump_above_reason = local_jump_reason
@@ -415,7 +516,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         self._last_action_used = int(action_used)
         self.prev_state = state
-        return self._normalize_observation(state.to_observation()), reward, terminated, truncated, info
+        return self._build_observation(state, attr_buffer_after), reward, terminated, truncated, info
 
     def close(self) -> None:
         self.client.close()
