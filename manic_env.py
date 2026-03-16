@@ -80,13 +80,13 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         # 0=no-op, 1=left(q), 2=right(w), 3=jump(space), 4=jump-left, 5=jump-right.
         self.action_space = gym.spaces.Discrete(6)
-        # 10 base features + 12 entity features + 3 exploration features:
+        # 10 base features + 12 entity features + 3 exploration features + 1 airborne flag:
         #   guardian (dx, dy, dist), nasty (dx, dy, dist), key (dx, dy, dist),
         #   lethal_overhead, lethal_left, lethal_right,
-        #   nearest_unvisited (dx, dy, dist)
+        #   nearest_unvisited (dx, dy, dist), is_airborne
         self.observation_space = gym.spaces.Box(
-            low=np.zeros(25, dtype=np.float32),
-            high=np.ones(25, dtype=np.float32),
+            low=np.zeros(26, dtype=np.float32),
+            high=np.ones(26, dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -100,6 +100,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self.visited_cells: Set[Tuple[int, int]] = set()
         self.configured_lethal_attrs_by_level: Dict[int, Set[int]] = {}
         self.configured_lethal_attr_groups_by_level: Dict[int, Tuple[Set[int], Set[int]]] = {}
+        self._solid_platform_cells_by_level: Dict[int, Set[Tuple[int, int]]] = {}
         self._rewarded_under_lethal_cells: Set[Tuple[int, int, int]] = set()
         self._last_dynamic_lethal_cells_count = 0
         self._last_repeat_signature: Optional[Tuple[int, ...]] = None
@@ -111,6 +112,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_key_level: Optional[int] = None
         self._tracked_keys_remaining = 0
         self._tracked_key_score_anchor = 0
+        self._action_mask: np.ndarray = np.ones(6, dtype=bool)
 
     def _rng_random(self) -> float:
         if hasattr(self, "np_random") and self.np_random is not None:
@@ -273,8 +275,56 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         dist_norm = float(np.clip(best_dist / (SCREEN_CELLS_W + SCREEN_CELLS_H), 0.0, 1.0))
         return dx_norm, dy_norm, dist_norm
 
-    def _build_observation(self, state: ManicState, attr_buffer: bytes) -> np.ndarray:
-        """Build the full 22-feature observation for the current state."""
+    def action_masks(self) -> np.ndarray:
+        """Return the cached action mask for use with MaskablePPO."""
+        return self._action_mask.copy()
+
+    def _compute_action_mask(
+        self, state: ManicState, attr_buffer: bytes, airborne_status: int
+    ) -> np.ndarray:
+        """Compute which actions are valid in the current state.
+
+        During airborne, only no-op (0) is valid — all inputs are suppressed.
+        On the ground, actions blocked by either local jump rules or the safety
+        shield are masked out so MaskablePPO never attributes rewards to actions
+        that would be silently replaced.  At least no-op (0) is always unmasked.
+        """
+        mask = np.ones(6, dtype=bool)
+        if self._is_airborne_status_active(airborne_status):
+            mask[1:] = False
+            return mask
+        if not self.safety_shield:
+            return mask
+
+        # Mirrors the cell-set computation in step() so both paths agree.
+        safety_level = state.level
+        moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(safety_level)
+        fixed_lethal = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
+        moving_lethal = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
+        any_lethal = moving_lethal | self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
+        key_cells = self._active_item_cells_for_level(safety_level, attr_buffer)
+
+        for action in range(6):
+            # Local jump rules (lethal proximity + arc projection checks).
+            _, blocked, _, _ = self._apply_local_jump_rules(
+                state, action, fixed_lethal, any_lethal, key_cells, moving_lethal
+            )
+            if blocked:
+                mask[action] = False
+                continue
+            # Safety shield (arc/walk projection against all dynamic lethals).
+            _, shielded, _ = self._apply_safety_shield(state, action, attr_buffer)
+            if shielded:
+                mask[action] = False
+
+        if not mask.any():
+            mask[0] = True
+        return mask
+
+    def _build_observation(
+        self, state: ManicState, attr_buffer: bytes, airborne_status: int = 0
+    ) -> np.ndarray:
+        """Build the full 26-feature observation for the current state."""
         base_obs = self._normalize_observation(state.to_observation())
 
         moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
@@ -293,11 +343,12 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         lethal_right = 1.0 if bool(self._front_cells_for_direction(state, 1) & all_lethal_cells) else 0.0
 
         uv_dx, uv_dy, uv_dist = self._nearest_unvisited_features(state.willy_x_px, state.willy_y_px)
+        is_airborne = 1.0 if self._is_airborne_status_active(airborne_status) else 0.0
 
         entity_obs = np.array(
             [g_dx, g_dy, g_dist, n_dx, n_dy, n_dist, k_dx, k_dy, k_dist,
              lethal_overhead, lethal_left, lethal_right,
-             uv_dx, uv_dy, uv_dist],
+             uv_dx, uv_dy, uv_dist, is_airborne],
             dtype=np.float32,
         )
         return np.concatenate([base_obs, entity_obs])
@@ -325,6 +376,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._stabilize_keys_remaining(state, force_reset=True)
         info = self.client.get_info()
         attr_buffer = self._read_attr_buffer()
+        airborne_status = self._read_u8(WILLY_AIRBORNE_ADDR)
 
         self.visited_cells.clear()
         self.visited_cells.update(self._covered_cells(state.willy_x_px, state.willy_y_px))
@@ -342,10 +394,11 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_keys_remaining = state.keys_remaining
         self._tracked_key_score_anchor = state.score
         self._rewarded_under_lethal_cells.clear()
+        self._action_mask = self._compute_action_mask(state, attr_buffer, airborne_status)
 
         info["state"] = state.__dict__.copy()
         info["first_key_mode"] = self.first_key_mode
-        return self._build_observation(state, attr_buffer), info
+        return self._build_observation(state, attr_buffer, airborne_status), info
 
     def step(self, action: int):
         self.step_count += 1
@@ -360,10 +413,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         safety_level = state_before.level
         moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(safety_level)
         fixed_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
-        willy_top_cell = state_before.willy_y_px // CELL_SIZE_PX
-        fixed_lethal_cells_before = self._filter_ceiling_protected(
-            fixed_lethal_cells_before, attr_buffer_before, moving_attrs | fixed_attrs, willy_top_cell
-        )
         moving_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, moving_attrs)
         dynamic_lethal_cells_before = moving_lethal_cells_before | self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
         key_cells_before = self._active_item_cells_for_level(safety_level, attr_buffer_before)
@@ -516,7 +565,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         self._last_action_used = int(action_used)
         self.prev_state = state
-        return self._build_observation(state, attr_buffer_after), reward, terminated, truncated, info
+        self._action_mask = self._compute_action_mask(state, attr_buffer_after, airborne_status_after)
+        return self._build_observation(state, attr_buffer_after, airborne_status_after), reward, terminated, truncated, info
 
     def close(self) -> None:
         self.client.close()

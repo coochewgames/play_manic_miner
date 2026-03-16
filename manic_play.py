@@ -88,12 +88,36 @@ class ManicPlayMixin:
             return self._jump_arc_offsets(1)
         return ((0, 0),)
 
-    def _projected_cells_for_action(self, state: ManicState, action: int) -> Set[Tuple[int, int]]:
+    def _projected_cells_for_action(
+        self,
+        state: ManicState,
+        action: int,
+        solid_cells: Optional[Set[Tuple[int, int]]] = None,
+    ) -> Set[Tuple[int, int]]:
+        """Project all cells Willy occupies along the action arc.
+
+        When solid_cells is provided (the precomputed solid-platform cell set
+        for the level), ascending arc phases are checked against it.  If the
+        top of Willy's projected sprite enters a solid platform cell the game
+        engine would cut the jump short there, so lethals beyond that phase
+        are unreachable and must not block the jump.
+        """
         cells: Set[Tuple[int, int]] = set()
+        prev_rise = 0
         for dx_px, dy_px in self._sample_offsets_for_action(action):
             x_px = max(0, min(255, state.willy_x_px + dx_px))
             y_px = max(0, min(191, state.willy_y_px + dy_px))
             cells.update(self._covered_cells(x_px, y_px))
+            if solid_cells is not None and dy_px < 0:
+                rise = -dy_px
+                if rise > prev_rise:  # still ascending
+                    prev_rise = rise
+                    top_cy = y_px // CELL_SIZE_PX
+                    cx0 = x_px // CELL_SIZE_PX
+                    cx1 = (x_px + WILLY_SIZE_PX - 1) // CELL_SIZE_PX
+                    for cx in range(cx0, cx1 + 1):
+                        if (cx, top_cy) in solid_cells:
+                            return cells  # solid platform ceiling truncates arc
         return cells
 
     def _apply_local_jump_rules(
@@ -108,47 +132,14 @@ class ManicPlayMixin:
         blocked_actions: Set[int] = set()
         reasons = []
 
+        # Only block jump-up when a fixed nasty is in the cell directly above —
+        # clearly unreachable any other way.  All arc-based blocking for
+        # directional jumps is handled by the safety shield (threshold = 2 cells)
+        # so the policy can still attempt jumps that only graze a lethal.
         fixed_above = bool(self._cells_above_willy(state) & fixed_lethal_cells)
-        fixed_above_right = bool(self._cells_above_right_willy(state) & fixed_lethal_cells)
-        fixed_above_left = bool(self._cells_above_left_willy(state) & fixed_lethal_cells)
-        fixed_on_jump_arc_right = bool(self._projected_cells_for_action(state, 5) & fixed_lethal_cells)
-        fixed_on_jump_arc_left = bool(self._projected_cells_for_action(state, 4) & fixed_lethal_cells)
-        lethal_next_right = bool(self._front_cells_for_direction(state, 1) & any_lethal_cells)
-        lethal_next_left = bool(self._front_cells_for_direction(state, -1) & any_lethal_cells)
-        # Arc checks combine ceiling-filtered fixed nasties (reachable by the arc)
-        # with moving guardian cells.  Unreachable (ceiling-protected) nasties are
-        # already absent from fixed_lethal_cells so they won't block unnecessarily.
-        arc_lethal_cells = fixed_lethal_cells | (moving_lethal_cells if moving_lethal_cells is not None else any_lethal_cells)
-        dynamic_on_jump_arc_right = bool(self._projected_cells_for_action(state, 5) & arc_lethal_cells)
-        dynamic_on_jump_arc_left = bool(self._projected_cells_for_action(state, 4) & arc_lethal_cells)
-
         if fixed_above:
             blocked_actions.add(3)
             reasons.append("block_jump_up_fixed_above")
-        if fixed_above_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_fixed_above_right")
-        if fixed_above_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_fixed_above_left")
-        if fixed_on_jump_arc_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_fixed_on_arc")
-        if fixed_on_jump_arc_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_fixed_on_arc")
-        if lethal_next_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_any_lethal_next_right")
-        if lethal_next_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_any_lethal_next_left")
-        if dynamic_on_jump_arc_right:
-            blocked_actions.add(5)
-            reasons.append("block_jump_right_dynamic_on_arc")
-        if dynamic_on_jump_arc_left:
-            blocked_actions.add(4)
-            reasons.append("block_jump_left_dynamic_on_arc")
 
         key_above_right = bool(self._cells_above_right_willy(state) & key_cells)
         key_above_left = bool(self._cells_above_left_willy(state) & key_cells)
@@ -185,7 +176,8 @@ class ManicPlayMixin:
         front_cells = self._front_cells_for_direction(state, direction)
         fixed_ahead = bool(front_cells & fixed_cells)
         moving_ahead = bool(front_cells & moving_cells)
-        explores_unvisited = bool(self._projected_cells_for_action(state, action) - self.visited_cells)
+        solid_cells = self._solid_platform_cells_for_level(state.level)
+        explores_unvisited = bool(self._projected_cells_for_action(state, action, solid_cells) - self.visited_cells)
 
         if fixed_ahead:
             return action, False, "jump_gate_allow_fixed_ahead"
@@ -197,8 +189,48 @@ class ManicPlayMixin:
         fallback = 1 if action == 4 else 2
         return fallback, True, f"jump_gate_block(action={action},fallback={fallback})"
 
+    def _arc_landing_cells(
+        self,
+        state: ManicState,
+        action: int,
+        solid_cells: Optional[Set[Tuple[int, int]]] = None,
+    ) -> Set[Tuple[int, int]]:
+        """Return cells occupied at the landing position of a jump arc.
+
+        Returns an empty set if:
+        - action is not a jump
+        - a solid ceiling truncates the arc before Willy lands
+
+        This lets callers apply a stricter (threshold=1) landing check
+        independently of the arc-body threshold.
+        """
+        offsets = self._sample_offsets_for_action(action)
+        if not offsets:
+            return set()
+        prev_rise = 0
+        for i, (dx_px, dy_px) in enumerate(offsets):
+            x_px = max(0, min(255, state.willy_x_px + dx_px))
+            y_px = max(0, min(191, state.willy_y_px + dy_px))
+            if solid_cells is not None and dy_px < 0:
+                rise = -dy_px
+                if rise > prev_rise:
+                    prev_rise = rise
+                    top_cy = y_px // CELL_SIZE_PX
+                    cx0 = x_px // CELL_SIZE_PX
+                    cx1 = (x_px + WILLY_SIZE_PX - 1) // CELL_SIZE_PX
+                    for cx in range(cx0, cx1 + 1):
+                        if (cx, top_cy) in solid_cells:
+                            return set()  # arc truncated before landing
+            if i == len(offsets) - 1:
+                return self._covered_cells(x_px, y_px)
+        return set()
+
     def _action_hits_dynamic_lethal(
-        self, state: ManicState, action: int, dynamic_lethal_cells: Set[Tuple[int, int]]
+        self,
+        state: ManicState,
+        action: int,
+        dynamic_lethal_cells: Set[Tuple[int, int]],
+        solid_cells: Optional[Set[Tuple[int, int]]] = None,
     ) -> bool:
         if action == 0:
             return False
@@ -210,9 +242,17 @@ class ManicPlayMixin:
         if action == 2:
             overlap = self._front_cells_for_direction(state, 1) & dynamic_lethal_cells
             return len(overlap) >= SAFETY_BLOCK_INTERSECTION_MIN_CELLS
-        projected_cells = self._projected_cells_for_action(state, action)
+        projected_cells = self._projected_cells_for_action(state, action, solid_cells)
         overlap = projected_cells & dynamic_lethal_cells
-        return len(overlap) >= SAFETY_JUMP_BLOCK_INTERSECTION_MIN_CELLS
+        if len(overlap) >= SAFETY_JUMP_BLOCK_INTERSECTION_MIN_CELLS:
+            return True
+        # Landing-position check: if Willy would land directly on a lethal
+        # that is 1 cell overlap, block it — landing is deterministic death.
+        # Only applies when the arc completes (not ceiling-truncated).
+        landing_cells = self._arc_landing_cells(state, action, solid_cells)
+        if landing_cells & dynamic_lethal_cells:
+            return True
+        return False
 
     def _safe_fallback_action(
         self, state: ManicState, blocked_action: int, dynamic_lethal_cells: Set[Tuple[int, int]]
@@ -230,45 +270,6 @@ class ManicPlayMixin:
                 return candidate
         return 0
 
-    def _filter_ceiling_protected(
-        self,
-        fixed_lethal: Set[Tuple[int, int]],
-        attr_buffer: bytes,
-        all_lethal_attrs: Set[int],
-        willy_top_cell: int,
-    ) -> Set[Tuple[int, int]]:
-        """Remove fixed nasty cells that a jump arc cannot physically reach.
-
-        A nasty at (cx, cy) is ceiling-protected — and excluded from jump
-        blocking — only when BOTH conditions hold:
-          1. The cell immediately below it (cx, cy+1) is a solid non-lethal
-             platform tile (i.e. present in the attr buffer and not itself
-             lethal), AND
-          2. Willy's TOP cell is strictly below that platform
-             (willy_top_cell > cy+1), meaning the platform is above Willy's
-             head and will stop the jump arc before it reaches the nasty.
-
-        If Willy's top is at or above the platform cell the jump starts from
-        that level and the nasty is reachable; it must not be filtered out.
-        """
-        accessible: Set[Tuple[int, int]] = set()
-        for cx, cy in fixed_lethal:
-            below_y = cy + 1
-            if below_y >= SCREEN_CELLS_H:
-                accessible.add((cx, cy))
-                continue
-            idx = below_y * SCREEN_CELLS_W + cx
-            if idx >= len(attr_buffer):
-                accessible.add((cx, cy))
-                continue
-            below_attr = int(attr_buffer[idx]) & 0x7F
-            if (below_attr != 0
-                    and below_attr not in all_lethal_attrs
-                    and willy_top_cell > below_y):
-                continue  # ceiling-protected: platform blocks the arc
-            accessible.add((cx, cy))
-        return accessible
-
     def _apply_safety_shield(
         self, state: ManicState, action: int, attr_buffer: Optional[bytes] = None
     ) -> Tuple[int, bool, str]:
@@ -278,25 +279,11 @@ class ManicPlayMixin:
         if attr_buffer is None:
             attr_buffer = self._read_attr_buffer()
 
-        # For jump actions, filter out fixed nasties that are on a platform
-        # ceiling the arc cannot physically reach.  Moving guardian cells are
-        # never filtered — their position changes during the arc.
-        if action in (3, 4, 5):
-            moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
-            moving_lethal = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
-            fixed_lethal = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
-            self._last_dynamic_lethal_cells_count = len(moving_lethal | fixed_lethal)
-            willy_top_cell = state.willy_y_px // CELL_SIZE_PX
-            all_lethal_attrs = moving_attrs | fixed_attrs
-            fixed_lethal = self._filter_ceiling_protected(
-                fixed_lethal, attr_buffer, all_lethal_attrs, willy_top_cell
-            )
-            dynamic_lethal_cells = moving_lethal | fixed_lethal
-        else:
-            dynamic_lethal_cells = self._dynamic_lethal_cells_for_level(state.level, attr_buffer)
-            self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells)
+        dynamic_lethal_cells = self._dynamic_lethal_cells_for_level(state.level, attr_buffer)
+        self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells)
+        solid_cells = self._solid_platform_cells_for_level(state.level)
 
-        if not self._action_hits_dynamic_lethal(state, action, dynamic_lethal_cells):
+        if not self._action_hits_dynamic_lethal(state, action, dynamic_lethal_cells, solid_cells):
             return action, False, ""
         fallback = self._safe_fallback_action(state, action, dynamic_lethal_cells)
         return fallback, True, f"configured_lethal_block(action={action},fallback={fallback})"

@@ -10,7 +10,7 @@ import socket
 import sys
 from typing import Any, Dict
 
-from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 
@@ -285,6 +285,31 @@ def parse_args() -> argparse.Namespace:
         default=0.02,
         help="PPO entropy coefficient (higher encourages more exploration)",
     )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.999,
+        help="PPO discount factor (effective horizon = 1/(1-gamma))",
+    )
+    parser.add_argument(
+        "--n-steps",
+        type=int,
+        default=2048,
+        help="PPO rollout buffer size (transitions collected before each gradient update)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="PPO minibatch size for gradient updates",
+    )
+    parser.add_argument(
+        "--net-arch",
+        type=int,
+        nargs="+",
+        default=[256, 256],
+        help="Hidden layer sizes for the MLP policy/value network",
+    )
     parser.add_argument("--visual", action="store_true", help="Run Fuse in visual mode")
     parser.add_argument("--visual-pace-ms", type=int, default=0, help="Visual pace per frame in ms")
     parser.add_argument(
@@ -391,22 +416,23 @@ def main() -> None:
     vec_env = VecMonitor(DummyVecEnv([make_env]))
 
     if args.load_model:
-        model = PPO.load(
+        model = MaskablePPO.load(
             args.load_model,
             env=vec_env,
             tensorboard_log=args.tensorboard_log,
         )
         logger.info("Loaded model from %s", args.load_model)
     else:
-        model = PPO(
+        model = MaskablePPO(
             "MlpPolicy",
             vec_env,
             verbose=1,
-            n_steps=512,
-            batch_size=128,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
             learning_rate=3e-4,
-            gamma=0.995,
+            gamma=args.gamma,
             ent_coef=args.ent_coef,
+            policy_kwargs={"net_arch": args.net_arch},
             tensorboard_log=args.tensorboard_log,
         )
 
@@ -427,6 +453,7 @@ def main() -> None:
                 progress_bar=not args.status_window,
                 callback=callback,
                 reset_num_timesteps=not bool(args.load_model),
+                use_masking=True,
             )
             learn_completed = True
         except socket.timeout as exc:

@@ -334,6 +334,57 @@ class ManicDataMixin:
                     cells.add((x_cell, y_cell))
         return cells
 
+    def _solid_platform_cells_for_level(self, level: int) -> Set[Tuple[int, int]]:
+        """Return the fixed solid-platform cells for a level (cached).
+
+        A cell is a solid platform if it appears in the static cavern layout
+        (the first CAVERN_LAYOUT_SIZE bytes of room data) with a non-zero
+        attribute that is not a lethal (guardian/nasty), not a collectible
+        item, and not the portal.  These are the only cells that physically
+        stop Willy's jump arc in the game engine.
+        """
+        cached = self._solid_platform_cells_by_level.get(level)
+        if cached is not None:
+            return cached
+
+        room = self._read_room_bytes(level)
+        if not room:
+            self._solid_platform_cells_by_level[level] = set()
+            return set()
+
+        lethal_attrs = self._configured_lethal_attrs_for_level(level)
+
+        # Collect all item attribute candidates so key cells are excluded.
+        item_attr_values: Set[int] = set()
+        for item_attr, _ in self._iter_item_slots_for_level(level):
+            item_attr_values.update(self._item_attr_candidates(item_attr))
+
+        # Portal cell — exclude it from solid detection.
+        portal_cells: Set[Tuple[int, int]] = set()
+        portal_xy = self._read_portal_xy_for_level(level)
+        if portal_xy is not None:
+            px, py = portal_xy
+            portal_cells.update(self._covered_cells(px, py))
+
+        layout = room[:CAVERN_LAYOUT_SIZE]
+        cells: Set[Tuple[int, int]] = set()
+        for idx, raw in enumerate(layout):
+            av = raw & 0x7F
+            if av == 0:
+                continue
+            if av in lethal_attrs:
+                continue
+            if av in item_attr_values:
+                continue
+            cx = idx % SCREEN_CELLS_W
+            cy = idx // SCREEN_CELLS_W
+            if (cx, cy) in portal_cells:
+                continue
+            cells.add((cx, cy))
+
+        self._solid_platform_cells_by_level[level] = cells
+        return cells
+
     def _dynamic_lethal_cells_for_level(self, level: int, attr_buffer: bytes) -> Set[Tuple[int, int]]:
         lethal_attrs = self._configured_lethal_attrs_for_level(level)
         return self._dynamic_cells_for_attrs(attr_buffer, lethal_attrs)
