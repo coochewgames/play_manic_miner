@@ -25,6 +25,8 @@ PLAY_MODULE_NAME = os.environ.get("MANIC_PLAY_MODULE", "manic_play")
 _play_module = importlib.import_module(PLAY_MODULE_NAME)
 ManicPlayMixin = _play_module.ManicPlayMixin
 PATHING_NEW_CELL_REWARD = _play_module.PATHING_NEW_CELL_REWARD
+FRONTIER_APPROACH_COEF = _play_module.FRONTIER_APPROACH_COEF
+KEY_APPROACH_REWARD_PER_PX = _play_module.KEY_APPROACH_REWARD_PER_PX
 logger = logging.getLogger(__name__)
 
 ACTION_KEY_CHORDS: Dict[int, str] = {
@@ -247,6 +249,20 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         dist_norm = float(np.clip(best_dist / (SCREEN_CELLS_W + SCREEN_CELLS_H), 0.0, 1.0))
         return dx_norm, dy_norm, dist_norm
 
+    def _nearest_unvisited_dist(self, willy_x_px: int, willy_y_px: int) -> float:
+        """Return the raw Manhattan distance (in cells) to the nearest unvisited cell.
+        Returns 0.0 if there are no unvisited cells."""
+        willy_cx = willy_x_px // CELL_SIZE_PX
+        willy_cy = willy_y_px // CELL_SIZE_PX
+        best_dist = float("inf")
+        for cx in range(SCREEN_CELLS_W):
+            for cy in range(SCREEN_CELLS_H):
+                if (cx, cy) not in self.visited_cells:
+                    dist = abs(cx - willy_cx) + abs(cy - willy_cy)
+                    if dist < best_dist:
+                        best_dist = dist
+        return 0.0 if best_dist == float("inf") else best_dist
+
     def _nearest_unvisited_features(self, willy_x_px: int, willy_y_px: int) -> Tuple[float, float, float]:
         """Return (dx_norm, dy_norm, dist_norm) to the nearest unvisited cell.
 
@@ -378,6 +394,13 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         attr_buffer = self._read_attr_buffer()
         airborne_status = self._read_u8(WILLY_AIRBORNE_ADDR)
 
+        # Reset visited cells every episode so there is always dense pathing
+        # signal.  Combined with frontier approach shaping, the agent earns
+        # pathing reward for the known lower cells then is guided toward the
+        # frontier by the approach reward.  Clear on level transition too.
+        prev_level = self.prev_state.level if self.prev_state is not None else None
+        if prev_level is not None and state.level == prev_level:
+            pass  # same level: reset per episode (done unconditionally below)
         self.visited_cells.clear()
         self.visited_cells.update(self._covered_cells(state.willy_x_px, state.willy_y_px))
         state.coverage_ratio = self._coverage_ratio()
@@ -407,6 +430,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         frames_used = self.frames_per_action
         random_action_applied = False
         state_before = self.prev_state if self.prev_state is not None else self._read_state()
+        _prev_uv_dist = self._nearest_unvisited_dist(state_before.willy_x_px, state_before.willy_y_px)
         airborne_status_before = self._read_u8(WILLY_AIRBORNE_ADDR)
         input_suppressed_for_airborne = self._is_airborne_status_active(airborne_status_before)
         attr_buffer_before = self._read_attr_buffer()
@@ -416,6 +440,17 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         moving_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, moving_attrs)
         dynamic_lethal_cells_before = moving_lethal_cells_before | self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
         key_cells_before = self._active_item_cells_for_level(safety_level, attr_buffer_before)
+        # Capture distance to nearest key before the action for key approach shaping.
+        if KEY_APPROACH_REWARD_PER_PX > 0.0 and key_cells_before:
+            _wx = state_before.willy_x_px + WILLY_SIZE_PX // 2
+            _wy = state_before.willy_y_px + WILLY_SIZE_PX // 2
+            _prev_key_dist: float = min(
+                abs(_wx - (cx * CELL_SIZE_PX + CELL_SIZE_PX // 2))
+                + abs(_wy - (cy * CELL_SIZE_PX + CELL_SIZE_PX // 2))
+                for (cx, cy) in key_cells_before
+            )
+        else:
+            _prev_key_dist = 0.0
         self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells_before)
         jump_above_blocked = False
         jump_above_reason = "-"
@@ -446,12 +481,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             )
             jump_above_blocked = "block_jump_up_fixed_above" in local_jump_reason
             jump_above_reason = local_jump_reason
-            if not local_jump_forced:
-                action_used, jump_gate_blocked, jump_gate_reason = self._apply_directional_jump_gate(
-                    state_before, action_used, attr_buffer_before
-                )
-            else:
-                jump_gate_reason = "jump_gate_skipped_for_key_forced_jump"
 
             action_used, walk_hysteresis_applied, walk_hysteresis_reason = self._apply_walk_direction_hysteresis(
                 action_used
@@ -498,6 +527,28 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             self._last_action_used,
             dynamic_lethal_cells_after,
         )
+
+        # Frontier approach shaping: reward reducing Manhattan distance to the
+        # nearest unvisited cell.  Guides the agent toward unvisited territory
+        # when there is no pathing reward (all reachable cells already visited).
+        if FRONTIER_APPROACH_COEF > 0.0:
+            _curr_uv_dist = self._nearest_unvisited_dist(state.willy_x_px, state.willy_y_px)
+            _approach = (_prev_uv_dist - _curr_uv_dist) * FRONTIER_APPROACH_COEF
+            reward += _approach
+
+        # Key approach shaping: reward per pixel closer to the nearest uncollected
+        # key.  Provides a dense gradient pulling the agent toward the key even
+        # when the key is far away and the sparse collect reward has low probability.
+        if KEY_APPROACH_REWARD_PER_PX > 0.0 and key_cells_before and _prev_key_dist > 0.0:
+            _curr_wx = state.willy_x_px + WILLY_SIZE_PX // 2
+            _curr_wy = state.willy_y_px + WILLY_SIZE_PX // 2
+            _curr_key_dist = min(
+                abs(_curr_wx - (cx * CELL_SIZE_PX + CELL_SIZE_PX // 2))
+                + abs(_curr_wy - (cy * CELL_SIZE_PX + CELL_SIZE_PX // 2))
+                for (cx, cy) in key_cells_before
+            )
+            reward += (_prev_key_dist - _curr_key_dist) * KEY_APPROACH_REWARD_PER_PX
+
         if under_lethal_detected and under_lethal_reason == "-":
             under_lethal_reason = "under_lethal_detected_no_reward"
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import socket
@@ -18,72 +19,6 @@ from logging_utils import configure_logging
 from manic_env import ManicMinerEnv
 
 logger = logging.getLogger(__name__)
-
-
-class StatusWindow:
-    """Fixed terminal status panel with in-place updates (no GUI backend)."""
-
-    def __init__(self, title: str):
-        self._title = title
-        self._fields = [
-            ("Timestep", "timestep"),
-            ("Key Chord", "action_key_chord"),
-            ("Local Jump", "local_jump_forced"),
-            ("Local Blocked", "local_jump_blocked"),
-            ("Local Reason", "local_jump_reason"),
-            ("Repeat Count", "repeat_count"),
-            ("Repeat Pen", "repeat_penalty"),
-            ("Repeat Why", "repeat_reason"),
-            ("Walk Reward", "walk_reward"),
-            ("Walk Why", "walk_reason"),
-            ("Under Lethal", "under_lethal_reward"),
-            ("Under Why", "under_lethal_reason"),
-            ("Walk Hold", "walk_hysteresis_applied"),
-            ("Walk Hold Why", "walk_hysteresis_reason"),
-            ("Jump Gate", "jump_gate_blocked"),
-            ("Safety Blocked", "safety_blocked"),
-            ("Safety Level", "safety_level"),
-            ("Lethal Cells", "known_lethal_cells"),
-            ("Lethal Attrs", "known_lethal_attrs"),
-            ("Willy X (px)", "willy_x_px"),
-            ("Willy Y (px)", "willy_y_px"),
-            ("Level", "level"),
-            ("Lives", "lives"),
-            ("Score", "score"),
-            ("Keys Remaining", "keys_remaining"),
-            ("Portal Open", "portal_open"),
-            ("Step Reward", "step_reward"),
-        ]
-        self._enabled = sys.stdout.isatty()
-        self._ansi_ok = self._enabled and os.environ.get("TERM", "dumb") != "dumb"
-        if not self._enabled:
-            logger.warning("Status window disabled because stdout is not a TTY")
-        elif not self._ansi_ok:
-            logger.warning("Status window disabled because terminal does not support ANSI control")
-
-    def update(self, values: Dict[str, Any]) -> None:
-        if not self._enabled or not self._ansi_ok:
-            return
-        lines = [f"{self._title}"]
-        for heading, key in self._fields:
-            value = values.get(key, "-")
-            text = f"{value:.3f}" if isinstance(value, float) else str(value)
-            lines.append(f"{heading:<16}: {text}")
-        # Preserve the active cursor used by other terminal output.
-        sys.stdout.write("\x1b7")
-        for row, line in enumerate(lines, start=1):
-            sys.stdout.write(f"\x1b[{row};1H\x1b[2K{line}")
-        sys.stdout.write("\x1b8")
-        sys.stdout.flush()
-
-    def close(self) -> None:
-        if self._enabled and self._ansi_ok:
-            sys.stdout.write("\x1b7")
-            total_rows = 1 + len(self._fields)
-            for row in range(1, total_rows + 1):
-                sys.stdout.write(f"\x1b[{row};1H\x1b[2K")
-            sys.stdout.write("\x1b8")
-            sys.stdout.flush()
 
 
 class SwitchToHeadlessCallback(BaseCallback):
@@ -102,80 +37,128 @@ class SwitchToHeadlessCallback(BaseCallback):
         return True
 
 
-class StatusWindowCallback(BaseCallback):
-    """Keep a small fixed status window updated during training."""
+class EpisodeLoggerCallback(BaseCallback):
+    """Write one JSON line per episode to a .jsonl log file."""
 
-    def __init__(self, title: str, refresh_steps: int):
+    def __init__(self, log_path: str):
         super().__init__()
-        self.title = str(title)
-        self.refresh_steps = max(1, int(refresh_steps))
-        self.window: StatusWindow | None = None
+        self.log_path = log_path
+        self._episode_count = 0
+        self._reset_accumulators()
+
+    def _reset_accumulators(self) -> None:
+        self._ep_steps = 0
+        self._ep_total_reward = 0.0
+        self._ep_objective = 0.0
+        self._ep_hazard = 0.0
+        self._ep_pathing = 0.0
+        self._ep_repeat_penalty = 0.0
+        self._ep_walk_reward = 0.0
+        self._ep_under_lethal = 0.0
+        self._ep_safety_triggers = 0
+        self._ep_jump_gate_blocks = 0
+        self._ep_life_losses = 0
+        self._ep_level = 0
+        self._ep_coverage_ratio = 0.0
+        self._ep_keys_remaining = 0
+        self._ep_configured_keys = 0
 
     def _on_training_start(self) -> None:
-        try:
-            self.window = StatusWindow(self.title)
-        except Exception as exc:
-            self.window = None
-            logger.error("Failed to create status window: %s", exc)
+        logger.info("Episode log: %s", self.log_path)
 
     def _on_step(self) -> bool:
-        if self.window is None:
-            return True
-        if self.num_timesteps % self.refresh_steps != 0:
-            return True
-
         infos = self.locals.get("infos", [])
         rewards = self.locals.get("rewards", [])
+        dones = self.locals.get("dones", [])
         if not infos:
             return True
 
         info = infos[0] if isinstance(infos[0], dict) else {}
-        state = info.get("state", {}) if isinstance(info.get("state"), dict) else {}
-        reward = rewards[0] if len(rewards) > 0 else "-"
-        values = {
-            "timestep": self.num_timesteps,
-            "action_key_chord": info.get("action_key_chord", "-"),
-            "local_jump_forced": info.get("local_jump_forced", "-"),
-            "local_jump_blocked": info.get("local_jump_blocked", "-"),
-            "local_jump_reason": info.get("local_jump_reason", "-"),
-            "repeat_count": info.get("repeat_count", "-"),
-            "repeat_penalty": info.get("repeat_penalty", "-"),
-            "repeat_reason": info.get("repeat_reason", "-"),
-            "walk_reward": info.get("walk_reward", "-"),
-            "walk_reason": info.get("walk_reason", "-"),
-            "under_lethal_reward": info.get("under_lethal_detected", "-"),
-            "under_lethal_reason": info.get("under_lethal_reason", "-"),
-            "walk_hysteresis_applied": info.get("walk_hysteresis_applied", "-"),
-            "walk_hysteresis_reason": info.get("walk_hysteresis_reason", "-"),
-            "jump_gate_blocked": info.get("jump_gate_blocked", "-"),
-            "safety_blocked": info.get("safety_blocked", "-"),
-            "safety_level": info.get("safety_level", "-"),
-            "known_lethal_cells": info.get("known_lethal_cells", "-"),
-            "known_lethal_attrs": info.get("known_lethal_attrs", "-"),
-            "willy_x_px": state.get("willy_x_px", "-"),
-            "willy_y_px": state.get("willy_y_px", "-"),
-            "level": state.get("level", "-"),
-            "lives": state.get("lives", "-"),
-            "score": state.get("score", "-"),
-            "keys_remaining": state.get("keys_remaining", "-"),
-            "portal_open": state.get("portal_open", "-"),
-            "step_reward": reward,
-        }
-        try:
-            self.window.update(values)
-        except Exception:
-            logger.warning("Status window closed or unavailable; disabling status window updates")
-            self.window = None
-        return True
+        reward = float(rewards[0]) if rewards else 0.0
+        done = bool(dones[0]) if dones else False
 
-    def _on_training_end(self) -> None:
-        if self.window is not None:
-            self.window.close()
-            self.window = None
+        state = info.get("state", {})
+        if not isinstance(state, dict):
+            state = {}
+
+        self._ep_steps += 1
+        self._ep_total_reward += reward
+        self._ep_objective += float(info.get("objective_reward", 0.0))
+        self._ep_hazard += float(info.get("hazard_reward", 0.0))
+        self._ep_pathing += float(info.get("pathing_reward", 0.0))
+        self._ep_repeat_penalty += float(info.get("repeat_penalty", 0.0))
+        self._ep_walk_reward += float(info.get("walk_reward", 0.0))
+        self._ep_under_lethal += float(info.get("under_lethal_reward", 0.0))
+        if info.get("safety_blocked"):
+            self._ep_safety_triggers += 1
+        if info.get("jump_gate_blocked"):
+            self._ep_jump_gate_blocks += 1
+        if info.get("life_lost_this_step"):
+            self._ep_life_losses += 1
+
+        level = state.get("level", 0)
+        if isinstance(level, int):
+            self._ep_level = max(self._ep_level, level)
+
+        coverage = state.get("coverage_ratio", 0.0)
+        if isinstance(coverage, (int, float)):
+            self._ep_coverage_ratio = float(coverage)
+
+        keys_remaining = state.get("keys_remaining")
+        configured_keys = info.get("configured_keys_for_level")
+        if isinstance(keys_remaining, int):
+            self._ep_keys_remaining = keys_remaining
+        if isinstance(configured_keys, int):
+            self._ep_configured_keys = configured_keys
+
+        if done:
+            if info.get("first_key_terminated"):
+                term_reason = "first_key"
+            elif state.get("lives", 1) == 0:
+                term_reason = "lives_exhausted"
+            elif info.get("life_lost_this_step"):
+                term_reason = "life_lost"
+            elif info.get("bridge_done"):
+                term_reason = "bridge_done"
+            else:
+                term_reason = "truncated"
+
+            keys_collected = max(0, self._ep_configured_keys - self._ep_keys_remaining)
+            self._episode_count += 1
+            record: Dict[str, Any] = {
+                "episode": self._episode_count,
+                "timestep": self.num_timesteps,
+                "steps": self._ep_steps,
+                "total_reward": round(self._ep_total_reward, 3),
+                "objective_reward": round(self._ep_objective, 3),
+                "hazard_reward": round(self._ep_hazard, 3),
+                "pathing_reward": round(self._ep_pathing, 3),
+                "repeat_penalty": round(self._ep_repeat_penalty, 3),
+                "walk_reward": round(self._ep_walk_reward, 3),
+                "under_lethal_reward": round(self._ep_under_lethal, 3),
+                "keys_collected": keys_collected,
+                "configured_keys": self._ep_configured_keys,
+                "keys_remaining": self._ep_keys_remaining,
+                "life_losses": self._ep_life_losses,
+                "safety_triggers": self._ep_safety_triggers,
+                "jump_gate_blocks": self._ep_jump_gate_blocks,
+                "level": self._ep_level,
+                "coverage_ratio": round(self._ep_coverage_ratio, 4),
+                "term_reason": term_reason,
+            }
+            try:
+                with open(self.log_path, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+            except Exception as exc:
+                logger.warning("Failed to write episode log: %s", exc)
+
+            self._reset_accumulators()
+
+        return True
 
 
 class RunSummaryCallback(BaseCallback):
-    """Collect and log run-level summary metrics."""
+    """Log a run-level summary at the end of training."""
 
     def __init__(self):
         super().__init__()
@@ -205,182 +188,87 @@ class RunSummaryCallback(BaseCallback):
             prev_cfg = self.configured_keys_by_level.get(level, 0)
             if configured_keys > prev_cfg:
                 self.configured_keys_by_level[level] = configured_keys
-            prev_min_remaining = self.min_keys_remaining_by_level.get(level, keys_remaining)
-            if keys_remaining < prev_min_remaining:
-                self.min_keys_remaining_by_level[level] = keys_remaining
-            else:
-                self.min_keys_remaining_by_level[level] = prev_min_remaining
+            prev_min = self.min_keys_remaining_by_level.get(level, keys_remaining)
+            self.min_keys_remaining_by_level[level] = min(prev_min, keys_remaining)
         return True
 
     def _on_training_end(self) -> None:
         if self.max_level_seen < 0:
             logger.info("Run summary: no environment state samples captured")
             return
-
-        reached_level = self.max_level_seen
-        configured_keys = self.configured_keys_by_level.get(reached_level)
-        min_keys_remaining = self.min_keys_remaining_by_level.get(reached_level)
-        cavern_number = reached_level + 1
-        if configured_keys is None or min_keys_remaining is None:
+        level = self.max_level_seen
+        configured = self.configured_keys_by_level.get(level)
+        min_remaining = self.min_keys_remaining_by_level.get(level)
+        cavern = level + 1
+        if configured is None or min_remaining is None:
             logger.info(
-                "Run summary: cavern reached in play testing=%s (level=%s), max keys collected in cavern reached=%s, highest score=%s",
-                cavern_number,
-                reached_level,
-                0,
-                self.max_score_seen,
+                "Run summary: cavern=%s level=%s keys_collected=0 score=%s",
+                cavern, level, self.max_score_seen,
             )
             return
-        bounded_remaining = max(0, min(configured_keys, min_keys_remaining))
-        max_keys_collected = max(0, configured_keys - bounded_remaining)
+        collected = max(0, configured - max(0, min(configured, min_remaining)))
         logger.info(
-            "Run summary: cavern reached in play testing=%s (level=%s), max keys collected in cavern reached=%s/%s, highest score=%s",
-            cavern_number,
-            reached_level,
-            max_keys_collected,
-            configured_keys,
-            self.max_score_seen,
+            "Run summary: cavern=%s level=%s keys_collected=%s/%s score=%s",
+            cavern, level, collected, configured, self.max_score_seen,
         )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO on Fuse Manic Miner")
     parser.add_argument("--socket", default="/tmp/fuse-ml.sock", help="UNIX socket path")
-    parser.add_argument(
-        "--socket-timeout-s",
-        type=float,
-        default=30.0,
-        help="Timeout in seconds for each ML bridge command",
-    )
+    parser.add_argument("--socket-timeout-s", type=float, default=30.0,
+                        help="Timeout in seconds for each ML bridge command")
     parser.add_argument("--timesteps", type=int, default=200_000, help="Training timesteps")
     parser.add_argument("--frames-per-action", type=int, default=2, help="Frames to step per action")
     parser.add_argument("--max-steps", type=int, default=4000, help="Max env steps per episode")
-    parser.add_argument(
-        "--random-action-prob",
-        type=float,
-        default=0.0,
-        help="Probability of replacing chosen action with a random action during training",
-    )
-    parser.add_argument(
-        "--reset-random-action-steps",
-        type=int,
-        default=8,
-        help="Maximum random warmup actions after RESET (uniformly sampled 0..N)",
-    )
+    parser.add_argument("--random-action-prob", type=float, default=0.0,
+                        help="Probability of replacing chosen action with a random action")
+    parser.add_argument("--reset-random-action-steps", type=int, default=8,
+                        help="Maximum random warmup actions after RESET")
     parser.add_argument("--model-out", default="ppo_manic_miner", help="Output model path prefix")
-    parser.add_argument(
-        "--load-model",
-        default="",
-        help="Path to an existing .zip model to continue training from",
-    )
+    parser.add_argument("--load-model", default="",
+                        help="Path to an existing .zip model to continue training from")
     parser.add_argument("--tensorboard-log", default="./tb_logs", help="TensorBoard log dir")
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Python logging level",
-    )
-    parser.add_argument(
-        "--ent-coef",
-        type=float,
-        default=0.02,
-        help="PPO entropy coefficient (higher encourages more exploration)",
-    )
-    parser.add_argument(
-        "--gamma",
-        type=float,
-        default=0.999,
-        help="PPO discount factor (effective horizon = 1/(1-gamma))",
-    )
-    parser.add_argument(
-        "--n-steps",
-        type=int,
-        default=2048,
-        help="PPO rollout buffer size (transitions collected before each gradient update)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=256,
-        help="PPO minibatch size for gradient updates",
-    )
-    parser.add_argument(
-        "--net-arch",
-        type=int,
-        nargs="+",
-        default=[256, 256],
-        help="Hidden layer sizes for the MLP policy/value network",
-    )
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--ent-coef", type=float, default=0.08,
+                        help="PPO entropy coefficient")
+    parser.add_argument("--gamma", type=float, default=0.999, help="PPO discount factor")
+    parser.add_argument("--n-steps", type=int, default=2048,
+                        help="PPO rollout buffer size")
+    parser.add_argument("--batch-size", type=int, default=256,
+                        help="PPO minibatch size")
+    parser.add_argument("--net-arch", type=int, nargs="+", default=[256, 256],
+                        help="Hidden layer sizes for the policy/value network")
     parser.add_argument("--visual", action="store_true", help="Run Fuse in visual mode")
-    parser.add_argument("--visual-pace-ms", type=int, default=0, help="Visual pace per frame in ms")
-    parser.add_argument(
-        "--visual-steps",
-        type=int,
-        default=0,
-        help="If > 0 and --visual is set, switch to headless after this many training timesteps",
-    )
-    parser.add_argument(
-        "--include-bridge-reward",
-        action="store_true",
-        help="Add bridge reward field to client-side reward shaping",
-    )
-    parser.add_argument(
-        "--pathing-reward",
-        type=float,
-        default=2.0,
-        help="Reward per newly visited screen cell",
-    )
-    parser.add_argument(
-        "--first-key-mode",
-        action="store_true",
-        help="Stage-1 curriculum: end episode when first key is collected",
-    )
-    parser.add_argument(
-        "--first-key-success-bonus",
-        type=float,
-        default=120.0,
-        help="Bonus reward when first key is collected in --first-key-mode",
-    )
-    parser.add_argument(
-        "--disable-safety-shield",
-        action="store_true",
-        help="Disable learned action blocking for previously observed lethal cells",
-    )
-    parser.add_argument(
-        "--infinite-air",
-        action="store_true",
-        help="Poke the air supply to maximum each step so it never decreases",
-    )
-    parser.add_argument(
-        "--status-window",
-        action="store_true",
-        help="Show a fixed live status window (input/actions/Willy position) during training",
-    )
-    parser.add_argument(
-        "--status-window-title",
-        default="Manic Miner Live Status",
-        help="Title text for the status window",
-    )
-    parser.add_argument(
-        "--status-refresh-steps",
-        type=int,
-        default=1,
-        help="Update frequency for status window in training timesteps",
-    )
+    parser.add_argument("--visual-pace-ms", type=int, default=0,
+                        help="Visual pace per frame in ms")
+    parser.add_argument("--visual-steps", type=int, default=0,
+                        help="Switch to headless after this many timesteps (requires --visual)")
+    parser.add_argument("--include-bridge-reward", action="store_true",
+                        help="Add bridge reward field to shaped reward")
+    parser.add_argument("--pathing-reward", type=float, default=3.0,
+                        help="Reward per newly visited screen cell")
+    parser.add_argument("--first-key-mode", action="store_true",
+                        help="Curriculum: end episode on first key collected")
+    parser.add_argument("--first-key-success-bonus", type=float, default=120.0,
+                        help="Bonus reward for first key in --first-key-mode")
+    parser.add_argument("--disable-safety-shield", action="store_true",
+                        help="Disable lethal-action blocking")
+    parser.add_argument("--infinite-air", action="store_true",
+                        help="Poke air supply to max each step")
+    parser.add_argument("--episode-log", default="episode_log.jsonl",
+                        help="Path for per-episode JSONL log file")
     return parser.parse_args()
 
 
 def check_fuse_reset_snapshot_env() -> None:
     snapshot_path = os.environ.get("FUSE_ML_RESET_SNAPSHOT", "").strip()
     if not snapshot_path:
-        logger.warning(
-            "FUSE_ML_RESET_SNAPSHOT is not set; Fuse RESET may fail or reset to an unexpected state"
-        )
-        return
-    if not os.path.exists(snapshot_path):
-        logger.warning("FUSE_ML_RESET_SNAPSHOT does not exist: %s", snapshot_path)
+        logger.warning("FUSE_ML_RESET_SNAPSHOT is not set")
         return
     if not os.path.isfile(snapshot_path):
-        logger.warning("FUSE_ML_RESET_SNAPSHOT is not a file: %s", snapshot_path)
+        logger.warning("FUSE_ML_RESET_SNAPSHOT does not exist or is not a file: %s", snapshot_path)
         return
     if not os.access(snapshot_path, os.R_OK):
         logger.warning("FUSE_ML_RESET_SNAPSHOT is not readable: %s", snapshot_path)
@@ -394,7 +282,7 @@ def main() -> None:
     check_fuse_reset_snapshot_env()
 
     def make_env():
-        env = ManicMinerEnv(
+        return ManicMinerEnv(
             socket_path=args.socket,
             socket_timeout_s=args.socket_timeout_s,
             frames_per_action=args.frames_per_action,
@@ -411,16 +299,11 @@ def main() -> None:
             pathing_new_cell_reward=args.pathing_reward,
             infinite_air=args.infinite_air,
         )
-        return env
 
     vec_env = VecMonitor(DummyVecEnv([make_env]))
 
     if args.load_model:
-        model = MaskablePPO.load(
-            args.load_model,
-            env=vec_env,
-            tensorboard_log=args.tensorboard_log,
-        )
+        model = MaskablePPO.load(args.load_model, env=vec_env, tensorboard_log=args.tensorboard_log)
         logger.info("Loaded model from %s", args.load_model)
     else:
         model = MaskablePPO(
@@ -436,48 +319,43 @@ def main() -> None:
             tensorboard_log=args.tensorboard_log,
         )
 
-    callbacks = []
-    callbacks.append(RunSummaryCallback())
+    callbacks: list = [
+        RunSummaryCallback(),
+        EpisodeLoggerCallback(args.episode_log),
+    ]
     if args.visual and args.visual_steps > 0:
         callbacks.append(SwitchToHeadlessCallback(args.visual_steps))
-    if args.status_window:
-        callbacks.append(StatusWindowCallback(args.status_window_title, args.status_refresh_steps))
-    callback = CallbackList(callbacks) if callbacks else None
 
     learn_completed = False
     timed_out = False
     try:
         try:
+            # Always reset the timestep counter so --timesteps means exactly
+            # "train for this many additional steps".  Policy weights are
+            # preserved regardless of reset_num_timesteps.
             model.learn(
                 total_timesteps=args.timesteps,
-                progress_bar=not args.status_window,
-                callback=callback,
-                reset_num_timesteps=not bool(args.load_model),
+                progress_bar=False,
+                callback=CallbackList(callbacks),
+                reset_num_timesteps=True,
                 use_masking=True,
             )
             learn_completed = True
         except socket.timeout as exc:
             timed_out = True
-            logger.warning(
-                "Fuse ML socket timed out during training; ending run early and saving partial model: %s",
-                exc,
-            )
+            logger.warning("Socket timed out; saving partial model: %s", exc)
     finally:
         try:
             model.save(args.model_out)
-            if learn_completed:
-                logger.info("Saved model to %s.zip", args.model_out)
-            elif timed_out:
-                logger.info("Saved partial model to %s.zip after timeout", args.model_out)
-            else:
-                logger.info("Saved model to %s.zip after interrupted training", args.model_out)
+            label = "partial (timeout)" if timed_out else ("partial (interrupted)" if not learn_completed else "")
+            suffix = f" [{label}]" if label else ""
+            logger.info("Saved model to %s.zip%s", args.model_out, suffix)
         except Exception as exc:
-            logger.error("Failed to save model %s.zip: %s", args.model_out, exc)
+            logger.error("Failed to save model: %s", exc)
         try:
             vec_env.env_method("quit_emulator")
-            logger.info("Sent QUIT to Fuse emulator")
         except Exception as exc:
-            logger.warning("Could not send QUIT to Fuse emulator: %s", exc)
+            logger.warning("Could not send QUIT to Fuse: %s", exc)
         vec_env.close()
 
 
