@@ -300,7 +300,7 @@ class ManicPlayMixin:
     ) -> float:
         reward = 0.0
         if keys_collected > 0:
-            reward += KEY_COLLECT_REWARD * float(keys_collected)
+            reward += self.key_collect_reward * float(keys_collected)
         if level_delta > 0:
             reward += LEVEL_COMPLETE_REWARD * float(level_delta)
         if prev_state.keys_remaining > 0 and state.keys_remaining == 0:
@@ -312,7 +312,15 @@ class ManicPlayMixin:
                 distance_delta = prev_distance - current_distance
                 if distance_delta > 0:
                     reward += EXIT_APPROACH_REWARD_PER_PX * distance_delta
-        if self.first_key_mode and first_key_achieved and not self.first_key_achieved:
+        # Give the success bonus when the Nth key is collected (where N =
+        # num_keys_mode).  Falls back to first-key behaviour when num_keys_mode=1.
+        # With num_keys_mode=0 (no curriculum) the bonus still fires on the first
+        # key as a soft incentive (decoupled from episode termination).
+        _nkm = getattr(self, "num_keys_mode", 1 if getattr(self, "first_key_mode", False) else 0)
+        _keys_now = self.keys_at_reset - state.keys_remaining
+        _keys_prev = self.keys_at_reset - prev_state.keys_remaining
+        _target = _nkm if _nkm > 0 else 1
+        if _keys_prev < _target <= _keys_now:
             reward += self.first_key_success_bonus
         return reward
 

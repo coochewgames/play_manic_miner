@@ -253,6 +253,10 @@ def parse_args() -> argparse.Namespace:
                         help="Curriculum: end episode on first key collected")
     parser.add_argument("--first-key-success-bonus", type=float, default=120.0,
                         help="Bonus reward for first key in --first-key-mode")
+    parser.add_argument("--num-keys-mode", type=int, default=0,
+                        help="Curriculum: terminate episode after collecting N keys (0=off, overrides --first-key-mode)")
+    parser.add_argument("--key-collect-reward", type=float, default=80.0,
+                        help="Reward per key collected (default 80)")
     parser.add_argument("--disable-safety-shield", action="store_true",
                         help="Disable lethal-action blocking")
     parser.add_argument("--infinite-air", action="store_true",
@@ -295,8 +299,10 @@ def main() -> None:
             reset_random_action_steps=args.reset_random_action_steps,
             first_key_mode=args.first_key_mode,
             first_key_success_bonus=args.first_key_success_bonus,
+            num_keys_mode=args.num_keys_mode,
             safety_shield=not args.disable_safety_shield,
             pathing_new_cell_reward=args.pathing_reward,
+            key_collect_reward=args.key_collect_reward,
             infinite_air=args.infinite_air,
         )
 

@@ -59,8 +59,10 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         reset_random_action_steps: int = 8,
         first_key_mode: bool = False,
         first_key_success_bonus: float = 120.0,
+        num_keys_mode: int = 0,
         safety_shield: bool = True,
         pathing_new_cell_reward: float = PATHING_NEW_CELL_REWARD,
+        key_collect_reward: float = 80.0,
         infinite_air: bool = False,
     ):
         super().__init__()
@@ -74,11 +76,19 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self.include_bridge_reward = include_bridge_reward
         self.random_action_prob = float(np.clip(random_action_prob, 0.0, 1.0))
         self.reset_random_action_steps = max(0, int(reset_random_action_steps))
-        self.first_key_mode = bool(first_key_mode)
+        # num_keys_mode generalises first_key_mode: episode terminates after N
+        # keys are collected and a success bonus fires at the Nth key.
+        # first_key_mode=True is treated as num_keys_mode=1 for backward compat.
+        _nkm = int(num_keys_mode)
+        if first_key_mode and _nkm == 0:
+            _nkm = 1
+        self.num_keys_mode = _nkm
+        self.first_key_mode = _nkm == 1  # kept for info/log compat
         self.first_key_success_bonus = float(first_key_success_bonus)
         self.infinite_air = bool(infinite_air)
         self.safety_shield = bool(safety_shield)
         self.pathing_new_cell_reward = float(pathing_new_cell_reward)
+        self.key_collect_reward = float(key_collect_reward)
 
         # 0=no-op, 1=left(q), 2=right(w), 3=jump(space), 4=jump-left, 5=jump-right.
         self.action_space = gym.spaces.Discrete(6)
@@ -115,6 +125,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_keys_remaining = 0
         self._tracked_key_score_anchor = 0
         self._action_mask: np.ndarray = np.ones(6, dtype=bool)
+        self._pending_key_reward: float = 0.0
 
     def _rng_random(self) -> float:
         if hasattr(self, "np_random") and self.np_random is not None:
@@ -417,6 +428,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_keys_remaining = state.keys_remaining
         self._tracked_key_score_anchor = state.score
         self._rewarded_under_lethal_cells.clear()
+        self._pending_key_reward = 0.0
         self._action_mask = self._compute_action_mask(state, attr_buffer, airborne_status)
 
         info["state"] = state.__dict__.copy()
@@ -553,9 +565,43 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             under_lethal_reason = "under_lethal_detected_no_reward"
 
         bridge_done = bool(ep["done"])
-        first_key_terminated = self.first_key_mode and first_key_achieved_now
-        terminated = bridge_done or state.lives == 0 or first_key_terminated
+        keys_collected_ep = self.keys_at_reset - state.keys_remaining
+        num_keys_terminated = (self.num_keys_mode > 0 and keys_collected_ep >= self.num_keys_mode)
+        first_key_terminated = num_keys_terminated and self.num_keys_mode == 1  # compat
+        terminated = bridge_done or state.lives == 0 or num_keys_terminated
         truncated = self.step_count >= self.max_steps
+
+        # Deferred key reward: keys collected mid-air only credited on safe
+        # landing.  Prevents the agent learning suicidal airborne key-grabs
+        # (e.g. jumping into a key from the wrong direction then dying on landing).
+        was_airborne = self._is_airborne_status_active(airborne_status_before)
+        is_still_airborne = self._is_airborne_status_active(airborne_status_after)
+        keys_collected_this_step = (
+            max(0, self.prev_state.keys_remaining - state.keys_remaining)
+            if self.prev_state is not None else 0
+        )
+        # Release or cancel pending reward from a previous airborne collection.
+        if self._pending_key_reward != 0.0:
+            if life_lost_this_step:
+                self._pending_key_reward = 0.0  # died before landing — cancel
+            elif not is_still_airborne:
+                reward += self._pending_key_reward  # landed safely — credit
+                objective_reward += self._pending_key_reward
+                self._pending_key_reward = 0.0
+            # else: still mid-jump — hold pending
+        # Defer key reward for keys collected THIS step while airborne,
+        # unless the episode terminates on this key (then credit immediately).
+        if was_airborne and keys_collected_this_step > 0 and not num_keys_terminated:
+            defer_amount = self.key_collect_reward * float(keys_collected_this_step)
+            _nkm_target = self.num_keys_mode if self.num_keys_mode > 0 else 1
+            _ep_keys_prev = self.keys_at_reset - self.prev_state.keys_remaining
+            if _ep_keys_prev < _nkm_target <= keys_collected_ep:
+                defer_amount += self.first_key_success_bonus
+            reward -= defer_amount
+            objective_reward -= defer_amount
+            if not life_lost_this_step:
+                self._pending_key_reward += defer_amount
+            # life_lost same step: reward already reduced, pending stays 0
 
         info: Dict[str, Any] = {
             "frame_count": ep["frame_count"],
