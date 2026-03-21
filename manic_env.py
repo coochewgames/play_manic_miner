@@ -92,7 +92,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         # 0=no-op, 1=left(q), 2=right(w), 3=jump(space), 4=jump-left, 5=jump-right.
         self.action_space = gym.spaces.Discrete(6)
         # 10 base features + 12 entity features + 3 exploration features + 1 airborne flag:
-        #   guardian (dx, dy, dist), nasty (dx, dy, dist), key (dx, dy, dist),
+        #   guardian (dx, dy, dist), nasty (dx, dy, dist), exit_portal (dx, dy, dist),
         #   lethal_overhead, lethal_left, lethal_right,
         #   nearest_unvisited (dx, dy, dist), is_airborne
         self.observation_space = gym.spaces.Box(
@@ -301,6 +301,29 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         dist_norm = float(np.clip(best_dist / (SCREEN_CELLS_W + SCREEN_CELLS_H), 0.0, 1.0))
         return dx_norm, dy_norm, dist_norm
 
+    def _exit_direction_features(self, state: ManicState) -> Tuple[float, float, float]:
+        """Return (dx_norm, dy_norm, dist_norm) from Willy to the exit portal.
+
+        Always present in the observation regardless of whether the portal is
+        open — the agent can use exit location as a landmark for route planning
+        even while collecting keys.  Returns (0.5, 0.5, 1.0) if the portal
+        position cannot be read from memory.
+        """
+        portal_xy = self._read_portal_xy_for_level(state.level)
+        if portal_xy is None:
+            return 0.5, 0.5, 1.0
+        willy_cx = state.willy_x_px // CELL_SIZE_PX
+        willy_cy = state.willy_y_px // CELL_SIZE_PX
+        exit_cx = portal_xy[0] // CELL_SIZE_PX
+        exit_cy = portal_xy[1] // CELL_SIZE_PX
+        dx = exit_cx - willy_cx
+        dy = exit_cy - willy_cy
+        dist = abs(dx) + abs(dy)
+        dx_norm = float(np.clip((dx + SCREEN_CELLS_W) / (2.0 * SCREEN_CELLS_W), 0.0, 1.0))
+        dy_norm = float(np.clip((dy + SCREEN_CELLS_H) / (2.0 * SCREEN_CELLS_H), 0.0, 1.0))
+        dist_norm = float(np.clip(dist / (SCREEN_CELLS_W + SCREEN_CELLS_H), 0.0, 1.0))
+        return dx_norm, dy_norm, dist_norm
+
     def action_masks(self) -> np.ndarray:
         """Return the cached action mask for use with MaskablePPO."""
         return self._action_mask.copy()
@@ -356,13 +379,12 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
         guardian_cells = self._dynamic_cells_for_attrs(attr_buffer, moving_attrs)
         nasty_cells = self._dynamic_cells_for_attrs(attr_buffer, fixed_attrs)
-        key_cells = self._active_item_cells_for_level(state.level, attr_buffer)
         all_lethal_cells = guardian_cells | nasty_cells
 
         wx, wy = state.willy_x_px, state.willy_y_px
         g_dx, g_dy, g_dist = self._nearest_entity_features(wx, wy, guardian_cells)
         n_dx, n_dy, n_dist = self._nearest_entity_features(wx, wy, nasty_cells)
-        k_dx, k_dy, k_dist = self._nearest_entity_features(wx, wy, key_cells)
+        e_dx, e_dy, e_dist = self._exit_direction_features(state)
 
         lethal_overhead = 1.0 if self._is_under_lethal(state, all_lethal_cells) else 0.0
         lethal_left = 1.0 if bool(self._front_cells_for_direction(state, -1) & all_lethal_cells) else 0.0
@@ -372,7 +394,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         is_airborne = 1.0 if self._is_airborne_status_active(airborne_status) else 0.0
 
         entity_obs = np.array(
-            [g_dx, g_dy, g_dist, n_dx, n_dy, n_dist, k_dx, k_dy, k_dist,
+            [g_dx, g_dy, g_dist, n_dx, n_dy, n_dist, e_dx, e_dy, e_dist,
              lethal_overhead, lethal_left, lethal_right,
              uv_dx, uv_dy, uv_dist, is_airborne],
             dtype=np.float32,
