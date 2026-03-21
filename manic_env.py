@@ -26,7 +26,6 @@ _play_module = importlib.import_module(PLAY_MODULE_NAME)
 ManicPlayMixin = _play_module.ManicPlayMixin
 PATHING_NEW_CELL_REWARD = _play_module.PATHING_NEW_CELL_REWARD
 FRONTIER_APPROACH_COEF = _play_module.FRONTIER_APPROACH_COEF
-KEY_APPROACH_REWARD_PER_PX = _play_module.KEY_APPROACH_REWARD_PER_PX
 logger = logging.getLogger(__name__)
 
 ACTION_KEY_CHORDS: Dict[int, str] = {
@@ -113,7 +112,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self.configured_lethal_attrs_by_level: Dict[int, Set[int]] = {}
         self.configured_lethal_attr_groups_by_level: Dict[int, Tuple[Set[int], Set[int]]] = {}
         self._solid_platform_cells_by_level: Dict[int, Set[Tuple[int, int]]] = {}
-        self._rewarded_under_lethal_cells: Set[Tuple[int, int, int]] = set()
         self._last_dynamic_lethal_cells_count = 0
         self._last_repeat_signature: Optional[Tuple[int, ...]] = None
         self._repeat_signature_count = 0
@@ -428,7 +426,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_key_level = state.level
         self._tracked_keys_remaining = state.keys_remaining
         self._tracked_key_score_anchor = state.score
-        self._rewarded_under_lethal_cells.clear()
         self._pending_key_reward = 0.0
         self._episode_min_keys_remaining = state.keys_remaining
         self._action_mask = self._compute_action_mask(state, attr_buffer, airborne_status)
@@ -454,22 +451,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         moving_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, moving_attrs)
         dynamic_lethal_cells_before = moving_lethal_cells_before | self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
         key_cells_before = self._active_item_cells_for_level(safety_level, attr_buffer_before)
-        # Capture distance to nearest safe key before the action for key approach shaping.
-        # Filter out key cells near fixed nasties so the approach reward does not
-        # guide the agent toward keys that are dangerous to reach (e.g. a key on a
-        # conveyor belt that kills Willy via a forced arc jump into a nasty).
-        if KEY_APPROACH_REWARD_PER_PX > 0.0 and key_cells_before:
-            _approach_key_cells = self._key_approach_targets(key_cells_before, fixed_lethal_cells_before)
-            _wx = state_before.willy_x_px + WILLY_SIZE_PX // 2
-            _wy = state_before.willy_y_px + WILLY_SIZE_PX // 2
-            _prev_key_dist: float = min(
-                abs(_wx - (cx * CELL_SIZE_PX + CELL_SIZE_PX // 2))
-                + abs(_wy - (cy * CELL_SIZE_PX + CELL_SIZE_PX // 2))
-                for (cx, cy) in _approach_key_cells
-            )
-        else:
-            _approach_key_cells: Set[Tuple[int, int]] = set()
-            _prev_key_dist = 0.0
         self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells_before)
         jump_above_blocked = False
         jump_above_reason = "-"
@@ -518,9 +499,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         state = self._read_state()
         self._stabilize_keys_remaining(state)
         attr_buffer_after = self._read_attr_buffer()
-        dynamic_lethal_cells_after = self._dynamic_lethal_cells_for_level(state.level, attr_buffer_after)
-        all_dynamic_lethal_cells = dynamic_lethal_cells_before | dynamic_lethal_cells_after
-        under_lethal_detected = int(self._is_under_lethal(state, all_dynamic_lethal_cells))
         airborne_status_after = self._read_u8(WILLY_AIRBORNE_ADDR)
         life_lost_this_step = self.prev_state is not None and state.lives < self.prev_state.lives
 
@@ -531,20 +509,14 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             hazard_reward,
             pathing_reward,
             repeat_penalty,
-            walk_reward,
-            under_lethal_reward,
             repeat_detected,
             repeat_count,
             repeat_reason,
-            walk_reason,
-            under_lethal_reason,
         ) = self._compute_reward(
             state,
             ep["reward"],
             first_key_achieved_now,
             action_used,
-            self._last_action_used,
-            dynamic_lethal_cells_after,
         )
 
         # Frontier approach shaping: reward reducing Manhattan distance to the
@@ -554,22 +526,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             _curr_uv_dist = self._nearest_unvisited_dist(state.willy_x_px, state.willy_y_px)
             _approach = (_prev_uv_dist - _curr_uv_dist) * FRONTIER_APPROACH_COEF
             reward += _approach
-
-        # Key approach shaping: reward per pixel closer to the nearest safe key.
-        # Uses the same filtered target set computed before the action so the
-        # pre/post distance comparison is consistent.
-        if KEY_APPROACH_REWARD_PER_PX > 0.0 and _approach_key_cells and _prev_key_dist > 0.0:
-            _curr_wx = state.willy_x_px + WILLY_SIZE_PX // 2
-            _curr_wy = state.willy_y_px + WILLY_SIZE_PX // 2
-            _curr_key_dist = min(
-                abs(_curr_wx - (cx * CELL_SIZE_PX + CELL_SIZE_PX // 2))
-                + abs(_curr_wy - (cy * CELL_SIZE_PX + CELL_SIZE_PX // 2))
-                for (cx, cy) in _approach_key_cells
-            )
-            reward += (_prev_key_dist - _curr_key_dist) * KEY_APPROACH_REWARD_PER_PX
-
-        if under_lethal_detected and under_lethal_reason == "-":
-            under_lethal_reason = "under_lethal_detected_no_reward"
 
         bridge_done = bool(ep["done"])
         keys_collected_ep = self.keys_at_reset - state.keys_remaining
@@ -656,11 +612,6 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             "hazard_reward": hazard_reward,
             "pathing_reward": pathing_reward,
             "repeat_penalty": repeat_penalty,
-            "walk_reward": walk_reward,
-            "walk_reason": walk_reason,
-            "under_lethal_detected": under_lethal_detected,
-            "under_lethal_reward": under_lethal_reward,
-            "under_lethal_reason": under_lethal_reason,
             "repeat_detected": repeat_detected,
             "repeat_count": repeat_count,
             "repeat_reason": repeat_reason,

@@ -13,9 +13,6 @@ KEY_COLLECT_REWARD = 80.0
 LEVEL_COMPLETE_REWARD = 1000.0
 ALL_KEYS_CLEARED_REWARD = 250.0
 EXIT_APPROACH_REWARD_PER_PX = 0.08
-KEY_APPROACH_REWARD_PER_PX = 0.2   # reward per px closer to nearest uncollected key
-KEY_APPROACH_LETHAL_MARGIN_CELLS = 4  # skip keys within this many cells of a fixed nasty
-
 # Hazards (negative)
 LIFE_LOSS_PENALTY = 80.0
 AIR_DECAY_PENALTY_COEF = 0.0002
@@ -26,12 +23,8 @@ REPEAT_TRANSITION_TOLERANCE = 1
 REPEAT_TRANSITION_PENALTY = 0.05
 REPEAT_TRANSITION_PENALTY_MAX = 0.3
 FRONTIER_APPROACH_COEF = 0.8   # reward per cell closer to nearest unvisited cell
-WALK_PROGRESS_REWARD_PER_PX = 0.0
-WALK_STREAK_BONUS = 0.0
-WALK_DIRECTION_FLIP_PENALTY = 0.0
-WALK_NO_PROGRESS_PENALTY = 0.0
-WALK_UNDER_LETHAL_REWARD_PER_CELL = 0.0
-JUMP_UNDER_LETHAL_PENALTY = 0.0
+
+# Under-lethal detection window (used for observation features)
 WALK_UNDER_LETHAL_VERTICAL_LOOKAHEAD_CELLS = 2
 WALK_UNDER_LETHAL_SIDE_MARGIN_CELLS = 1
 
@@ -291,34 +284,6 @@ class ManicPlayMixin:
         fallback = self._safe_fallback_action(state, action, dynamic_lethal_cells)
         return fallback, True, f"configured_lethal_block(action={action},fallback={fallback})"
 
-    def _key_approach_targets(
-        self,
-        key_cells: Set[Tuple[int, int]],
-        fixed_lethal_cells: Set[Tuple[int, int]],
-    ) -> Set[Tuple[int, int]]:
-        """Return the subset of key_cells safe to use as approach targets.
-
-        Filters out key cells where any fixed nasty is within
-        KEY_APPROACH_LETHAL_MARGIN_CELLS (Manhattan distance in cells).
-        This prevents the approach reward from guiding the agent toward
-        keys that are dangerous to reach (e.g. a key near a conveyor belt
-        that pushes Willy into a nasty).
-
-        Falls back to the full key_cells set if none pass the filter so
-        there is always a valid approach target.
-        """
-        if not fixed_lethal_cells or KEY_APPROACH_LETHAL_MARGIN_CELLS <= 0:
-            return key_cells
-        safe: Set[Tuple[int, int]] = set()
-        for kx, ky in key_cells:
-            near_lethal = any(
-                abs(kx - lx) + abs(ky - ly) <= KEY_APPROACH_LETHAL_MARGIN_CELLS
-                for lx, ly in fixed_lethal_cells
-            )
-            if not near_lethal:
-                safe.add((kx, ky))
-        return safe if safe else key_cells
-
     def _objective_reward(
         self,
         state: ManicState,
@@ -424,43 +389,6 @@ class ManicPlayMixin:
         reason = f"repeat_transition(count={self._repeat_signature_count},action={action_used})"
         return penalty, True, self._repeat_signature_count, reason
 
-    def _walk_behavior_reward(
-        self,
-        prev_state: Optional[ManicState],
-        state: ManicState,
-        action_used: int,
-        prev_action_used: Optional[int],
-    ) -> Tuple[float, str]:
-        if prev_state is None:
-            return 0.0, "-"
-        if action_used not in (1, 2):
-            return 0.0, "-"
-
-        x_delta = state.willy_x_px - prev_state.willy_x_px
-        expected_sign = -1 if action_used == 1 else 1
-        moved_in_expected_direction = x_delta * expected_sign > 0
-
-        reward = 0.0
-        reasons = []
-        if moved_in_expected_direction:
-            progress_px = abs(x_delta)
-            reward += WALK_PROGRESS_REWARD_PER_PX * float(progress_px)
-            reasons.append(f"walk_progress_px={progress_px}")
-            if prev_action_used == action_used:
-                reward += WALK_STREAK_BONUS
-                reasons.append("walk_streak")
-        else:
-            reward -= WALK_NO_PROGRESS_PENALTY
-            reasons.append("walk_no_progress")
-
-        if prev_action_used in (1, 2) and prev_action_used != action_used:
-            reward -= WALK_DIRECTION_FLIP_PENALTY
-            reasons.append("walk_direction_flip")
-
-        if not reasons:
-            return reward, "-"
-        return reward, ",".join(reasons)
-
     def _under_lethal_overlap_cells(
         self, state: ManicState, dynamic_lethal_cells: Set[Tuple[int, int]]
     ) -> Set[Tuple[int, int]]:
@@ -485,65 +413,13 @@ class ManicPlayMixin:
     def _is_under_lethal(self, state: ManicState, dynamic_lethal_cells: Set[Tuple[int, int]]) -> bool:
         return bool(self._under_lethal_overlap_cells(state, dynamic_lethal_cells))
 
-    def _walk_under_lethal_reward(
-        self,
-        prev_state: Optional[ManicState],
-        state: ManicState,
-        action_used: int,
-        dynamic_lethal_cells: Set[Tuple[int, int]],
-    ) -> Tuple[float, str]:
-        if prev_state is None:
-            return 0.0, "-"
-        if action_used not in (1, 2):
-            return 0.0, "-"
-        if not dynamic_lethal_cells:
-            return 0.0, "-"
-
-        x_delta = state.willy_x_px - prev_state.willy_x_px
-        expected_sign = -1 if action_used == 1 else 1
-        if x_delta * expected_sign <= 0:
-            return 0.0, "-"
-
-        overhead = self._under_lethal_overlap_cells(state, dynamic_lethal_cells)
-        if not overhead:
-            return 0.0, "-"
-
-        newly_rewarded = 0
-        for x_cell, y_cell in overhead:
-            key = (state.level, x_cell, y_cell)
-            if key in self._rewarded_under_lethal_cells:
-                continue
-            self._rewarded_under_lethal_cells.add(key)
-            newly_rewarded += 1
-
-        if newly_rewarded <= 0:
-            return 0.0, "-"
-        reward = WALK_UNDER_LETHAL_REWARD_PER_CELL * float(newly_rewarded)
-        reason = f"walk_under_lethal_new_cells={newly_rewarded},overhead_cells={len(overhead)}"
-        return reward, reason
-
-    def _jump_under_lethal_penalty(
-        self,
-        state: ManicState,
-        action_used: int,
-        dynamic_lethal_cells: Set[Tuple[int, int]],
-    ) -> Tuple[float, str]:
-        if action_used not in (3, 4, 5):
-            return 0.0, "-"
-        overhead = self._under_lethal_overlap_cells(state, dynamic_lethal_cells)
-        if not overhead:
-            return 0.0, "-"
-        return -JUMP_UNDER_LETHAL_PENALTY, f"jump_under_lethal_penalty,overhead_cells={len(overhead)}"
-
     def _compute_reward(
         self,
         state: ManicState,
         bridge_reward: int,
         first_key_achieved: bool,
         action_used: int,
-        prev_action_used: Optional[int],
-        dynamic_lethal_cells: Set[Tuple[int, int]],
-    ) -> Tuple[float, float, float, float, float, float, float, bool, int, str, str, str]:
+    ) -> Tuple[float, float, float, float, float, bool, int, str]:
         if self.prev_state is None:
             objective = 0.0
             hazards = 0.0
@@ -581,31 +457,8 @@ class ManicPlayMixin:
             action_used,
             pathing,
         )
-        walk_reward, walk_reason = self._walk_behavior_reward(
-            self.prev_state,
-            state,
-            action_used,
-            prev_action_used,
-        )
-        under_lethal_reward, under_lethal_reason = self._walk_under_lethal_reward(
-            self.prev_state,
-            state,
-            action_used,
-            dynamic_lethal_cells,
-        )
-        jump_lethal_penalty, jump_lethal_reason = self._jump_under_lethal_penalty(
-            state,
-            action_used,
-            dynamic_lethal_cells,
-        )
-        under_lethal_reward += jump_lethal_penalty
-        if jump_lethal_reason != "-":
-            under_lethal_reason = (
-                jump_lethal_reason if under_lethal_reason == "-"
-                else f"{under_lethal_reason},{jump_lethal_reason}"
-            )
 
-        reward = objective + hazards + pathing + repeat_penalty + walk_reward + under_lethal_reward
+        reward = objective + hazards + pathing + repeat_penalty
         if self.include_bridge_reward:
             reward += float(bridge_reward)
 
@@ -616,11 +469,7 @@ class ManicPlayMixin:
             hazards,
             pathing,
             repeat_penalty,
-            walk_reward,
-            under_lethal_reward,
             repeat_detected,
             repeat_count,
             repeat_reason,
-            walk_reason,
-            under_lethal_reason,
         )

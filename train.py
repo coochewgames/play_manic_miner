@@ -53,8 +53,6 @@ class EpisodeLoggerCallback(BaseCallback):
         self._ep_hazard = 0.0
         self._ep_pathing = 0.0
         self._ep_repeat_penalty = 0.0
-        self._ep_walk_reward = 0.0
-        self._ep_under_lethal = 0.0
         self._ep_safety_triggers = 0
         self._ep_jump_gate_blocks = 0
         self._ep_life_losses = 0
@@ -87,8 +85,6 @@ class EpisodeLoggerCallback(BaseCallback):
         self._ep_hazard += float(info.get("hazard_reward", 0.0))
         self._ep_pathing += float(info.get("pathing_reward", 0.0))
         self._ep_repeat_penalty += float(info.get("repeat_penalty", 0.0))
-        self._ep_walk_reward += float(info.get("walk_reward", 0.0))
-        self._ep_under_lethal += float(info.get("under_lethal_reward", 0.0))
         if info.get("safety_blocked"):
             self._ep_safety_triggers += 1
         if info.get("jump_gate_blocked"):
@@ -134,8 +130,6 @@ class EpisodeLoggerCallback(BaseCallback):
                 "hazard_reward": round(self._ep_hazard, 3),
                 "pathing_reward": round(self._ep_pathing, 3),
                 "repeat_penalty": round(self._ep_repeat_penalty, 3),
-                "walk_reward": round(self._ep_walk_reward, 3),
-                "under_lethal_reward": round(self._ep_under_lethal, 3),
                 "keys_collected": keys_collected,
                 "configured_keys": self._ep_configured_keys,
                 "keys_remaining": self._ep_keys_remaining,
