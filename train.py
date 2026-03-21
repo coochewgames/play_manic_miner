@@ -228,7 +228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-out", default="ppo_manic_miner", help="Output model path prefix")
     parser.add_argument("--load-model", default="",
                         help="Path to an existing .zip model to continue training from")
-    parser.add_argument("--tensorboard-log", default="./tb_logs", help="TensorBoard log dir")
+    parser.add_argument("--tensorboard-log", default=None, help="TensorBoard log dir (None disables)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--ent-coef", type=float, default=0.08,

@@ -14,6 +14,7 @@ LEVEL_COMPLETE_REWARD = 1000.0
 ALL_KEYS_CLEARED_REWARD = 250.0
 EXIT_APPROACH_REWARD_PER_PX = 0.08
 KEY_APPROACH_REWARD_PER_PX = 0.2   # reward per px closer to nearest uncollected key
+KEY_APPROACH_LETHAL_MARGIN_CELLS = 4  # skip keys within this many cells of a fixed nasty
 
 # Hazards (negative)
 LIFE_LOSS_PENALTY = 80.0
@@ -290,6 +291,34 @@ class ManicPlayMixin:
         fallback = self._safe_fallback_action(state, action, dynamic_lethal_cells)
         return fallback, True, f"configured_lethal_block(action={action},fallback={fallback})"
 
+    def _key_approach_targets(
+        self,
+        key_cells: Set[Tuple[int, int]],
+        fixed_lethal_cells: Set[Tuple[int, int]],
+    ) -> Set[Tuple[int, int]]:
+        """Return the subset of key_cells safe to use as approach targets.
+
+        Filters out key cells where any fixed nasty is within
+        KEY_APPROACH_LETHAL_MARGIN_CELLS (Manhattan distance in cells).
+        This prevents the approach reward from guiding the agent toward
+        keys that are dangerous to reach (e.g. a key near a conveyor belt
+        that pushes Willy into a nasty).
+
+        Falls back to the full key_cells set if none pass the filter so
+        there is always a valid approach target.
+        """
+        if not fixed_lethal_cells or KEY_APPROACH_LETHAL_MARGIN_CELLS <= 0:
+            return key_cells
+        safe: Set[Tuple[int, int]] = set()
+        for kx, ky in key_cells:
+            near_lethal = any(
+                abs(kx - lx) + abs(ky - ly) <= KEY_APPROACH_LETHAL_MARGIN_CELLS
+                for lx, ly in fixed_lethal_cells
+            )
+            if not near_lethal:
+                safe.add((kx, ky))
+        return safe if safe else key_cells
+
     def _objective_reward(
         self,
         state: ManicState,
@@ -317,10 +346,12 @@ class ManicPlayMixin:
         # With num_keys_mode=0 (no curriculum) the bonus still fires on the first
         # key as a soft incentive (decoupled from episode termination).
         _nkm = getattr(self, "num_keys_mode", 1 if getattr(self, "first_key_mode", False) else 0)
-        _keys_now = self.keys_at_reset - state.keys_remaining
-        _keys_prev = self.keys_at_reset - prev_state.keys_remaining
         _target = _nkm if _nkm > 0 else 1
-        if _keys_prev < _target <= _keys_now:
+        # Use monotone episode min so the bonus only fires once per distinct key.
+        _ep_min = getattr(self, '_episode_min_keys_remaining', state.keys_remaining)
+        _distinct_now = self.keys_at_reset - _ep_min
+        _distinct_prev = _distinct_now - keys_collected
+        if _distinct_prev < _target <= _distinct_now:
             reward += self.first_key_success_bonus
         return reward
 
@@ -520,7 +551,14 @@ class ManicPlayMixin:
             lives_delta = state.lives - self.prev_state.lives
             level_delta = state.level - self.prev_state.level
             air_delta = state.air - self.prev_state.air
-            keys_collected = max(0, self.prev_state.keys_remaining - state.keys_remaining)
+            # Monotone floor: use the episode minimum keys_remaining as the
+            # baseline so that keys respawning after a death never trigger a
+            # second reward for the same key.
+            _ep_min = getattr(self, '_episode_min_keys_remaining', self.prev_state.keys_remaining)
+            _floor = min(self.prev_state.keys_remaining, _ep_min)
+            keys_collected = max(0, _floor - state.keys_remaining)
+            if keys_collected > 0:
+                self._episode_min_keys_remaining = state.keys_remaining
 
             # 1) Objectives: positive rewards for game goals.
             objective = self._objective_reward(

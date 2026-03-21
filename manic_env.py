@@ -126,6 +126,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_key_score_anchor = 0
         self._action_mask: np.ndarray = np.ones(6, dtype=bool)
         self._pending_key_reward: float = 0.0
+        self._episode_min_keys_remaining: int = 0
 
     def _rng_random(self) -> float:
         if hasattr(self, "np_random") and self.np_random is not None:
@@ -429,6 +430,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_key_score_anchor = state.score
         self._rewarded_under_lethal_cells.clear()
         self._pending_key_reward = 0.0
+        self._episode_min_keys_remaining = state.keys_remaining
         self._action_mask = self._compute_action_mask(state, attr_buffer, airborne_status)
 
         info["state"] = state.__dict__.copy()
@@ -452,16 +454,21 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         moving_lethal_cells_before = self._dynamic_cells_for_attrs(attr_buffer_before, moving_attrs)
         dynamic_lethal_cells_before = moving_lethal_cells_before | self._dynamic_cells_for_attrs(attr_buffer_before, fixed_attrs)
         key_cells_before = self._active_item_cells_for_level(safety_level, attr_buffer_before)
-        # Capture distance to nearest key before the action for key approach shaping.
+        # Capture distance to nearest safe key before the action for key approach shaping.
+        # Filter out key cells near fixed nasties so the approach reward does not
+        # guide the agent toward keys that are dangerous to reach (e.g. a key on a
+        # conveyor belt that kills Willy via a forced arc jump into a nasty).
         if KEY_APPROACH_REWARD_PER_PX > 0.0 and key_cells_before:
+            _approach_key_cells = self._key_approach_targets(key_cells_before, fixed_lethal_cells_before)
             _wx = state_before.willy_x_px + WILLY_SIZE_PX // 2
             _wy = state_before.willy_y_px + WILLY_SIZE_PX // 2
             _prev_key_dist: float = min(
                 abs(_wx - (cx * CELL_SIZE_PX + CELL_SIZE_PX // 2))
                 + abs(_wy - (cy * CELL_SIZE_PX + CELL_SIZE_PX // 2))
-                for (cx, cy) in key_cells_before
+                for (cx, cy) in _approach_key_cells
             )
         else:
+            _approach_key_cells: Set[Tuple[int, int]] = set()
             _prev_key_dist = 0.0
         self._last_dynamic_lethal_cells_count = len(dynamic_lethal_cells_before)
         jump_above_blocked = False
@@ -548,16 +555,16 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
             _approach = (_prev_uv_dist - _curr_uv_dist) * FRONTIER_APPROACH_COEF
             reward += _approach
 
-        # Key approach shaping: reward per pixel closer to the nearest uncollected
-        # key.  Provides a dense gradient pulling the agent toward the key even
-        # when the key is far away and the sparse collect reward has low probability.
-        if KEY_APPROACH_REWARD_PER_PX > 0.0 and key_cells_before and _prev_key_dist > 0.0:
+        # Key approach shaping: reward per pixel closer to the nearest safe key.
+        # Uses the same filtered target set computed before the action so the
+        # pre/post distance comparison is consistent.
+        if KEY_APPROACH_REWARD_PER_PX > 0.0 and _approach_key_cells and _prev_key_dist > 0.0:
             _curr_wx = state.willy_x_px + WILLY_SIZE_PX // 2
             _curr_wy = state.willy_y_px + WILLY_SIZE_PX // 2
             _curr_key_dist = min(
                 abs(_curr_wx - (cx * CELL_SIZE_PX + CELL_SIZE_PX // 2))
                 + abs(_curr_wy - (cy * CELL_SIZE_PX + CELL_SIZE_PX // 2))
-                for (cx, cy) in key_cells_before
+                for (cx, cy) in _approach_key_cells
             )
             reward += (_prev_key_dist - _curr_key_dist) * KEY_APPROACH_REWARD_PER_PX
 
@@ -576,10 +583,13 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         # (e.g. jumping into a key from the wrong direction then dying on landing).
         was_airborne = self._is_airborne_status_active(airborne_status_before)
         is_still_airborne = self._is_airborne_status_active(airborne_status_after)
-        keys_collected_this_step = (
-            max(0, self.prev_state.keys_remaining - state.keys_remaining)
-            if self.prev_state is not None else 0
-        )
+        # Use monotone floor (same logic as _compute_reward) so airborne
+        # deferral doesn't double-count respawned keys after a death.
+        if self.prev_state is not None:
+            _floor = min(self.prev_state.keys_remaining, self._episode_min_keys_remaining)
+            keys_collected_this_step = max(0, _floor - state.keys_remaining)
+        else:
+            keys_collected_this_step = 0
         # Release or cancel pending reward from a previous airborne collection.
         if self._pending_key_reward != 0.0:
             if life_lost_this_step:
@@ -594,8 +604,9 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         if was_airborne and keys_collected_this_step > 0 and not num_keys_terminated:
             defer_amount = self.key_collect_reward * float(keys_collected_this_step)
             _nkm_target = self.num_keys_mode if self.num_keys_mode > 0 else 1
-            _ep_keys_prev = self.keys_at_reset - self.prev_state.keys_remaining
-            if _ep_keys_prev < _nkm_target <= keys_collected_ep:
+            _distinct_now = self.keys_at_reset - self._episode_min_keys_remaining
+            _distinct_prev = _distinct_now - keys_collected_this_step
+            if _distinct_prev < _nkm_target <= _distinct_now:
                 defer_amount += self.first_key_success_bonus
             reward -= defer_amount
             objective_reward -= defer_amount
