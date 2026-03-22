@@ -13,7 +13,7 @@ from typing import Any, Dict
 
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
 from logging_utils import configure_logging
 from manic_env import ManicMinerEnv
@@ -257,6 +257,12 @@ def parse_args() -> argparse.Namespace:
                         help="Poke air supply to max each step")
     parser.add_argument("--episode-log", default="episode_log.jsonl",
                         help="Path for per-episode JSONL log file")
+    parser.add_argument("--num-envs", type=int, default=1,
+                        help="Number of parallel environments (requires one Fuse socket per env)")
+    parser.add_argument("--socket-base", default="",
+                        help="Base socket path for parallel envs: e.g. /tmp/fuse-ml produces "
+                             "/tmp/fuse-ml-0.sock, /tmp/fuse-ml-1.sock, ... "
+                             "(ignored when --num-envs 1; use --socket instead)")
     return parser.parse_args()
 
 
@@ -279,28 +285,39 @@ def main() -> None:
     configure_logging(level=getattr(logging, args.log_level))
     check_fuse_reset_snapshot_env()
 
-    def make_env():
-        return ManicMinerEnv(
-            socket_path=args.socket,
-            socket_timeout_s=args.socket_timeout_s,
-            frames_per_action=args.frames_per_action,
-            max_steps=args.max_steps,
-            headless=not args.visual,
-            visual_pace_ms=args.visual_pace_ms,
-            auto_reset_on_done=False,
-            include_bridge_reward=args.include_bridge_reward,
-            random_action_prob=args.random_action_prob,
-            reset_random_action_steps=args.reset_random_action_steps,
-            first_key_mode=args.first_key_mode,
-            first_key_success_bonus=args.first_key_success_bonus,
-            num_keys_mode=args.num_keys_mode,
-            safety_shield=not args.disable_safety_shield,
-            pathing_new_cell_reward=args.pathing_reward,
-            key_collect_reward=args.key_collect_reward,
-            infinite_air=args.infinite_air,
-        )
+    def make_env(socket_path: str):
+        def _factory():
+            return ManicMinerEnv(
+                socket_path=socket_path,
+                socket_timeout_s=args.socket_timeout_s,
+                frames_per_action=args.frames_per_action,
+                max_steps=args.max_steps,
+                headless=not args.visual,
+                visual_pace_ms=args.visual_pace_ms,
+                auto_reset_on_done=False,
+                include_bridge_reward=args.include_bridge_reward,
+                random_action_prob=args.random_action_prob,
+                reset_random_action_steps=args.reset_random_action_steps,
+                first_key_mode=args.first_key_mode,
+                first_key_success_bonus=args.first_key_success_bonus,
+                num_keys_mode=args.num_keys_mode,
+                safety_shield=not args.disable_safety_shield,
+                pathing_new_cell_reward=args.pathing_reward,
+                key_collect_reward=args.key_collect_reward,
+                infinite_air=args.infinite_air,
+            )
+        return _factory
 
-    vec_env = VecMonitor(DummyVecEnv([make_env]))
+    num_envs = max(1, args.num_envs)
+    if num_envs > 1:
+        if not args.socket_base:
+            raise ValueError("--socket-base is required when --num-envs > 1")
+        socket_paths = [f"{args.socket_base}-{i}.sock" for i in range(num_envs)]
+        logger.info("Using %d parallel envs on sockets: %s", num_envs, socket_paths)
+        env_fns = [make_env(sp) for sp in socket_paths]
+        vec_env = VecMonitor(SubprocVecEnv(env_fns))
+    else:
+        vec_env = VecMonitor(DummyVecEnv([make_env(args.socket)]))
 
     if args.load_model:
         model = MaskablePPO.load(args.load_model, env=vec_env, tensorboard_log=args.tensorboard_log)

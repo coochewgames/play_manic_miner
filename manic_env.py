@@ -39,6 +39,7 @@ ACTION_KEY_CHORDS: Dict[int, str] = {
 
 WALK_FLIP_HYSTERESIS_STEPS = 2
 KEY_SCORE_INCREMENT = 100
+MAX_KEY_SLOTS = 5
 
 
 class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
@@ -91,13 +92,14 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
 
         # 0=no-op, 1=left(q), 2=right(w), 3=jump(space), 4=jump-left, 5=jump-right.
         self.action_space = gym.spaces.Discrete(6)
-        # 10 base features + 12 entity features + 3 exploration features + 1 airborne flag:
+        # 10 base features + 16 entity/exploration features + 15 key features:
         #   guardian (dx, dy, dist), nasty (dx, dy, dist), exit_portal (dx, dy, dist),
         #   lethal_overhead, lethal_left, lethal_right,
-        #   nearest_unvisited (dx, dy, dist), is_airborne
+        #   nearest_unvisited (dx, dy, dist), is_airborne,
+        #   key_0..4 (dx, dy, collected_flag) × 5 slots in ROM order
         self.observation_space = gym.spaces.Box(
-            low=np.zeros(26, dtype=np.float32),
-            high=np.ones(26, dtype=np.float32),
+            low=np.zeros(41, dtype=np.float32),
+            high=np.ones(41, dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -125,6 +127,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._action_mask: np.ndarray = np.ones(6, dtype=bool)
         self._pending_key_reward: float = 0.0
         self._episode_min_keys_remaining: int = 0
+        self._canonical_key_slots: list = []  # cached per episode from ROM
 
     def _rng_random(self) -> float:
         if hasattr(self, "np_random") and self.np_random is not None:
@@ -324,6 +327,29 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         dist_norm = float(np.clip(dist / (SCREEN_CELLS_W + SCREEN_CELLS_H), 0.0, 1.0))
         return dx_norm, dy_norm, dist_norm
 
+    def _all_key_features(self, state: ManicState, attr_buffer: bytes) -> np.ndarray:
+        """Return (dx_norm, dy_norm, collected_flag) × MAX_KEY_SLOTS = 15 features.
+
+        Slots are in canonical ROM order (stable for the lifetime of the episode).
+        collected_flag = 1.0 when the key has been picked up (no longer visible),
+        0.0 while still present.  Unused slots beyond the actual key count are
+        padded with (0.5, 0.5, 1.0) — i.e. no direction info, already collected.
+        """
+        willy_cx = state.willy_x_px // CELL_SIZE_PX
+        willy_cy = state.willy_y_px // CELL_SIZE_PX
+        feats: list = []
+        for item_attr, (kx, ky) in self._canonical_key_slots:
+            dx = kx - willy_cx
+            dy = ky - willy_cy
+            dx_norm = float(np.clip((dx + SCREEN_CELLS_W) / (2.0 * SCREEN_CELLS_W), 0.0, 1.0))
+            dy_norm = float(np.clip((dy + SCREEN_CELLS_H) / (2.0 * SCREEN_CELLS_H), 0.0, 1.0))
+            collected = 0.0 if self._is_item_visible_at_cell(attr_buffer, item_attr, (kx, ky)) else 1.0
+            feats += [dx_norm, dy_norm, collected]
+        # Pad to MAX_KEY_SLOTS slots
+        while len(feats) < MAX_KEY_SLOTS * 3:
+            feats += [0.5, 0.5, 1.0]
+        return np.array(feats[:MAX_KEY_SLOTS * 3], dtype=np.float32)
+
     def action_masks(self) -> np.ndarray:
         """Return the cached action mask for use with MaskablePPO."""
         return self._action_mask.copy()
@@ -373,7 +399,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
     def _build_observation(
         self, state: ManicState, attr_buffer: bytes, airborne_status: int = 0
     ) -> np.ndarray:
-        """Build the full 26-feature observation for the current state."""
+        """Build the full 41-feature observation for the current state."""
         base_obs = self._normalize_observation(state.to_observation())
 
         moving_attrs, fixed_attrs = self._configured_lethal_attr_groups_for_level(state.level)
@@ -399,7 +425,8 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
              uv_dx, uv_dy, uv_dist, is_airborne],
             dtype=np.float32,
         )
-        return np.concatenate([base_obs, entity_obs])
+        key_obs = self._all_key_features(state, attr_buffer)
+        return np.concatenate([base_obs, entity_obs, key_obs])
 
     def reset(
         self,
@@ -450,6 +477,7 @@ class ManicMinerEnv(ManicDataMixin, ManicPlayMixin, gym.Env):
         self._tracked_key_score_anchor = state.score
         self._pending_key_reward = 0.0
         self._episode_min_keys_remaining = state.keys_remaining
+        self._canonical_key_slots = self._iter_item_slots_for_level(state.level)
         self._action_mask = self._compute_action_mask(state, attr_buffer, airborne_status)
 
         info["state"] = state.__dict__.copy()
