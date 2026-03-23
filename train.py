@@ -72,8 +72,8 @@ class EpisodeLoggerCallback(BaseCallback):
             return True
 
         info = infos[0] if isinstance(infos[0], dict) else {}
-        reward = float(rewards[0]) if rewards else 0.0
-        done = bool(dones[0]) if dones else False
+        reward = float(rewards[0]) if len(rewards) > 0 else 0.0
+        done = bool(dones[0]) if len(dones) > 0 else False
 
         state = info.get("state", {})
         if not isinstance(state, dict):

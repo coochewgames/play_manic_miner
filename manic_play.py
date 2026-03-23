@@ -21,7 +21,7 @@ AIR_DECAY_PENALTY_COEF = 0.0002
 PATHING_NEW_CELL_REWARD = 8.0
 REPEAT_TRANSITION_TOLERANCE = 1
 REPEAT_TRANSITION_PENALTY = 0.05
-REPEAT_TRANSITION_PENALTY_MAX = 0.3
+REPEAT_TRANSITION_PENALTY_MAX = 2.0
 FRONTIER_APPROACH_COEF = 0.8   # reward per cell closer to nearest unvisited cell
 
 # Under-lethal detection window (used for observation features)
@@ -62,6 +62,19 @@ JUMP_ARC_Y_FROM_START_PX = (
 
 class ManicPlayMixin:
     """Methods that decide actions and calculate rewards."""
+
+    @staticmethod
+    def _lethals_near_cells(
+        target_cells: Set[Tuple[int, int]],
+        lethal_cells: Set[Tuple[int, int]],
+        radius: int = 2,
+    ) -> bool:
+        """Return True if any lethal cell is within `radius` cells of any target cell."""
+        for tx, ty in target_cells:
+            for lx, ly in lethal_cells:
+                if abs(tx - lx) <= radius and abs(ty - ly) <= radius:
+                    return True
+        return False
 
     def _jump_arc_offsets(self, horizontal_sign: int) -> Tuple[Tuple[int, int], ...]:
         offsets = []
@@ -142,11 +155,17 @@ class ManicPlayMixin:
         key_above = bool(self._cells_above_willy(state) & key_cells)
 
         if key_above_right and 5 not in blocked_actions:
-            return 5, False, True, "force_jump_right_key_above_right"
+            target = self._cells_above_right_willy(state) & key_cells
+            if not self._lethals_near_cells(target, any_lethal_cells):
+                return 5, False, True, "force_jump_right_key_above_right"
         if key_above_left and 4 not in blocked_actions:
-            return 4, False, True, "force_jump_left_key_above_left"
+            target = self._cells_above_left_willy(state) & key_cells
+            if not self._lethals_near_cells(target, any_lethal_cells):
+                return 4, False, True, "force_jump_left_key_above_left"
         if key_above and 3 not in blocked_actions:
-            return 3, False, True, "force_jump_up_key_above"
+            target = self._cells_above_willy(state) & key_cells
+            if not self._lethals_near_cells(target, any_lethal_cells):
+                return 3, False, True, "force_jump_up_key_above"
 
         if action in blocked_actions:
             fallback = 0
