@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train PPO with a custom CNN policy on the visual Manic Miner environment."""
+"""Train PPO with a custom CNN policy on the semantic Manic Miner environment."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
 from logging_utils import configure_logging
-from manic_env_visual import ManicMinerVisualEnv
+from manic_env_semantic import ManicMinerSemanticEnv
 
 logger = logging.getLogger(__name__)
 
@@ -25,16 +25,17 @@ logger = logging.getLogger(__name__)
 # ── Custom CNN feature extractor ──────────────────────────────────────────────
 #
 # SB3's NatureCNN is designed for 84×84 Atari frames and its three
-# convolutional layers reduce a 24×32 input to zero height.  This extractor
-# uses smaller kernels suited to the 24×32 attribute grid.
+# convolutional layers reduce a 16×32 input to zero height.  This extractor
+# uses smaller kernels suited to the 16×32 semantic grid.
 #
-# Input after VecTransposeImage: (B, C, 24, 32), C = n_stack (default 4).
+# Input after VecTransposeImage: (B, C, 16, 32),
+#   C = 5 channels (solid, nasty, willy, guardian, key) × n_stack (default 4) = 20.
 #
 # Spatial sizes after each layer:
-#   Conv(3, s=1, p=1)  →  (32, 24, 32)
-#   Conv(3, s=2)       →  (64, 11, 15)
-#   Conv(3, s=1)       →  (64,  9, 13)
-#   Flatten            →  64 × 9 × 13 = 7488
+#   Conv(3, s=1, p=1)  →  (32, 16, 32)
+#   Conv(3, s=2)       →  (64,  7, 15)
+#   Conv(3, s=1)       →  (64,  5, 13)
+#   Flatten            →  64 × 5 × 13 = 4160
 #   Linear             →  features_dim
 
 
@@ -141,7 +142,7 @@ def parse_args() -> argparse.Namespace:
                    help="Emulator frames advanced per agent action")
     p.add_argument("--max-steps", type=int, default=4000,
                    help="Max env steps per episode before truncation")
-    p.add_argument("--model-out", default="manic_visual", help="Output model path prefix (no .zip)")
+    p.add_argument("--model-out", default="manic_semantic", help="Output model path prefix (no .zip)")
     p.add_argument("--load-model", default="", help="Path to an existing .zip to continue from")
     p.add_argument("--tensorboard-log", default=None)
     p.add_argument("--log-level", default="INFO",
@@ -162,12 +163,9 @@ def parse_args() -> argparse.Namespace:
                    help="No-op steps after reset to let the snapshot finish loading")
     p.add_argument("--no-infinite-air", action="store_true",
                    help="Let the air supply deplete normally (default: infinite)")
-    p.add_argument("--pathing-reward", type=float, default=0.0,
+    p.add_argument("--pathing-reward", type=float, default=0.01,
                    help="Reward per newly visited screen cell (0=off). "
                         "Keep small (e.g. 0.01) so key reward (+1.0) stays dominant.")
-    p.add_argument("--key-proximity-reward", type=float, default=0.0,
-                   help="Reward scale for getting closer to the first (green) key each step. "
-                        "Disabled once that key is collected. (0=off, try 0.3)")
     p.add_argument("--visual", action="store_true", help="Run Fuse in visual mode")
     p.add_argument("--visual-pace-ms", type=int, default=0)
     p.add_argument("--episode-log", default="episode_log.jsonl")
@@ -198,7 +196,7 @@ def main() -> None:
     logger.info("Using device: %s", device)
 
     def make_env():
-        return ManicMinerVisualEnv(
+        return ManicMinerSemanticEnv(
             socket_path=args.socket,
             socket_timeout_s=args.socket_timeout_s,
             frames_per_action=args.frames_per_action,
@@ -210,7 +208,6 @@ def main() -> None:
             warmup_steps=args.warmup_steps,
             infinite_air=not args.no_infinite_air,
             pathing_reward=args.pathing_reward,
-            key_proximity_reward=args.key_proximity_reward,
         )
 
     # Stack 4 frames; SB3 will apply VecTransposeImage automatically for CnnPolicy.

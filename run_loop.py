@@ -40,7 +40,7 @@ FUSE_READY_POLL_S    = 0.25    # seconds between readiness checks
 
 PYTHON          = str(Path(sys.executable))
 TRAIN_SCRIPT    = str(Path(__file__).parent / "train.py")
-MODEL_PATH      = "manic_visual"
+MODEL_PATH      = "manic_semantic"
 EPISODE_LOG     = "episode_log.jsonl"
 
 

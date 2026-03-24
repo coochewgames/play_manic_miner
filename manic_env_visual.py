@@ -51,8 +51,13 @@ def _decode_score(data: bytes) -> int:
 class ManicMinerVisualEnv(gym.Env):
     """Gymnasium environment using the 32×24 ZX Spectrum attribute grid as observation.
 
-    Single-frame observation shape: (24, 32, 1) uint8, channels-last.
-    Wrap with VecFrameStack(n_stack=4) in training to get (24, 32, 4).
+    Each attribute byte is decomposed into three channels:
+      Ch 0 – ink colour  (bits 2-0, values 0-7, scaled to 0-252)
+      Ch 1 – paper colour (bits 5-3, values 0-7, scaled to 0-252)
+      Ch 2 – bright flag  (bit 6,    values 0-1, scaled to 0-255)
+
+    Single-frame observation shape: (24, 32, 3) uint8, channels-last.
+    Wrap with VecFrameStack(n_stack=4) in training to get (24, 32, 12).
 
     Actions: 6 discrete (no-op, left, right, jump, jump-left, jump-right).
 
@@ -104,7 +109,7 @@ class ManicMinerVisualEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=0,
             high=255,
-            shape=(SCREEN_CELLS_H, SCREEN_CELLS_W, 1),
+            shape=(SCREEN_CELLS_H, SCREEN_CELLS_W, 3),
             dtype=np.uint8,
         )
         self.action_space = spaces.Discrete(len(ACTIONS))
@@ -188,7 +193,10 @@ class ManicMinerVisualEnv(gym.Env):
 
     def _to_obs(self, attr_bytes: bytes) -> np.ndarray:
         arr = np.frombuffer(attr_bytes, dtype=np.uint8).reshape(SCREEN_CELLS_H, SCREEN_CELLS_W)
-        return arr[:, :, np.newaxis]  # (24, 32, 1) channels-last
+        ink    = (arr & 0x07).astype(np.uint8) * 36           # ink colour   0-7 → 0-252
+        paper  = ((arr >> 3) & 0x07).astype(np.uint8) * 36   # paper colour 0-7 → 0-252
+        bright = ((arr >> 6) & 0x01).astype(np.uint8) * 255  # bright flag  0-1 → 0-255
+        return np.stack([ink, paper, bright], axis=-1)         # (24, 32, 3) channels-last
 
     # ── gymnasium API ─────────────────────────────────────────────────────────
 
