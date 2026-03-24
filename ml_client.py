@@ -106,3 +106,21 @@ class FuseMLClient:
             "done": int(parts[6]),
             "reset": int(parts[7]),
         }
+
+    def get_attrs(self) -> bytes:
+        """Fetch the 32×24 ZX Spectrum attribute grid (768 bytes) from 0x5800."""
+        response = self.cmd("GETATTRS")
+        # ATTRS <1536_hex>
+        parts = response.split(maxsplit=1)
+        if len(parts) != 2 or parts[0] != "ATTRS":
+            raise RuntimeError(f"Unexpected GETATTRS response: {response!r}")
+        return bytes.fromhex(parts[1])
+
+    def step_attrs(self, key_chord: str, frames: int) -> tuple[int, bytes]:
+        """Step the emulator and return (frame_count, attr_grid_bytes) atomically."""
+        response = self.cmd(f"STEP_ATTRS {key_chord} {frames}")
+        # OBS <frame_count> <1536_hex>
+        parts = response.split(maxsplit=2)
+        if len(parts) != 3 or parts[0] != "OBS":
+            raise RuntimeError(f"Unexpected STEP_ATTRS response: {response!r}")
+        return int(parts[1]), bytes.fromhex(parts[2])

@@ -6,7 +6,7 @@ Responsibilities:
   2. Launch Fuse in the background.
   3. Poll the ML socket with PING until Fuse is ready.
   4. Run train.py (blocking).  train.py sends QUIT to Fuse when it finishes.
-  5. Run analyse_run.py and print the report.
+  5. Run analyse_run.py and print the report (if it exists).
 
 Usage (single run):
     python run_loop.py
@@ -15,7 +15,7 @@ Usage (N iterations, continuing from previous model):
     python run_loop.py --iterations 5 --timesteps 50000
 
 All train.py flags can be passed after --train-args:
-    python run_loop.py --train-args "--pathing-reward 3.0 --ent-coef 0.03"
+    python run_loop.py --train-args "--ent-coef 0.03"
 """
 
 from __future__ import annotations
@@ -32,17 +32,15 @@ from pathlib import Path
 # ── defaults ──────────────────────────────────────────────────────────────────
 
 FUSE_BIN         = "/Users/roddy/Dev/fuse/fuse/fuse"
-FUSE_SOCKET      = "/tmp/fuse-ml.sock"      # used when --num-envs 1
-FUSE_SOCKET_BASE = "/tmp/fuse-ml"           # used when --num-envs > 1  (→ /tmp/fuse-ml-0.sock …)
+FUSE_SOCKET      = "/tmp/fuse-ml.sock"
 FUSE_SNAPSHOT    = "/Users/roddy/Dev/fuse/play_manic_miner/manicminer.szx"
 FUSE_SPEED       = 3000        # emulation speed % (headless; no rendering overhead)
 FUSE_READY_TIMEOUT_S = 30      # max seconds to wait for Fuse to accept connections
 FUSE_READY_POLL_S    = 0.25    # seconds between readiness checks
 
-PYTHON          = str(Path(sys.executable))  # same venv python that runs this script
+PYTHON          = str(Path(sys.executable))
 TRAIN_SCRIPT    = str(Path(__file__).parent / "train.py")
-ANALYSE_SCRIPT  = str(Path(__file__).parent / "analyse_run.py")
-MODEL_PATH      = "ppo_manic_miner"
+MODEL_PATH      = "manic_visual"
 EPISODE_LOG     = "episode_log.jsonl"
 
 
@@ -56,7 +54,6 @@ def kill_existing_fuse(socket_path: str) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(3.0)
         sock.connect(socket_path)
-        # drain the banner
         _readline_sock(sock)
         sock.sendall(b"QUIT\n")
         try:
@@ -68,7 +65,6 @@ def kill_existing_fuse(socket_path: str) -> None:
         time.sleep(1.0)
     except Exception:
         pass
-    # Remove stale socket file if Fuse didn't clean it up.
     try:
         os.unlink(socket_path)
     except FileNotFoundError:
@@ -128,20 +124,13 @@ def wait_for_fuse_ready(socket_path: str, timeout_s: float, poll_s: float) -> bo
             if "PONG" in pong or pong.startswith("OK"):
                 print(f"[loop] Fuse ready after {attempt} poll(s).")
                 return True
-        except Exception as exc:
+        except Exception:
             pass
         time.sleep(poll_s)
     return False
 
 
 # ── subprocess helpers ────────────────────────────────────────────────────────
-
-def socket_paths_for(num_envs: int) -> list[str]:
-    """Return the list of socket paths for the given number of envs."""
-    if num_envs <= 1:
-        return [FUSE_SOCKET]
-    return [f"{FUSE_SOCKET_BASE}-{i}.sock" for i in range(num_envs)]
-
 
 def run_training(
     timesteps: int,
@@ -150,23 +139,18 @@ def run_training(
     load_model: str,
     extra_args: list[str],
     visual: bool,
-    num_envs: int,
 ) -> int:
     env = os.environ.copy()
     env["FUSE_ML_RESET_SNAPSHOT"] = FUSE_SNAPSHOT
+    env["FUSE_ML_SOCKET"] = FUSE_SOCKET
 
-    sockets = socket_paths_for(num_envs)
     cmd = [
         PYTHON, TRAIN_SCRIPT,
         "--timesteps", str(timesteps),
         "--model-out", model_out,
         "--episode-log", episode_log,
+        "--socket", FUSE_SOCKET,
     ]
-    if num_envs <= 1:
-        env["FUSE_ML_SOCKET"] = FUSE_SOCKET
-        cmd += ["--socket", FUSE_SOCKET]
-    else:
-        cmd += ["--num-envs", str(num_envs), "--socket-base", FUSE_SOCKET_BASE]
     if load_model and Path(load_model + ".zip").exists():
         cmd += ["--load-model", load_model]
         print(f"[loop] Continuing from model: {load_model}.zip")
@@ -181,10 +165,13 @@ def run_training(
 
 
 def run_analysis(episode_log: str, tail: int = 0) -> None:
+    analyse_script = Path(__file__).parent / "analyse_run.py"
+    if not analyse_script.exists():
+        return
     if not Path(episode_log).exists():
         print("[loop] No episode log found — skipping analysis.")
         return
-    cmd = [PYTHON, ANALYSE_SCRIPT, episode_log]
+    cmd = [PYTHON, str(analyse_script), episode_log]
     if tail > 0:
         cmd += ["--tail", str(tail)]
     print("\n" + "=" * 60)
@@ -215,58 +202,47 @@ def parse_args() -> argparse.Namespace:
                    help="Extra arguments forwarded verbatim to train.py (quote the whole string)")
     p.add_argument("--snapshot", default=FUSE_SNAPSHOT,
                    help="Path to the .szx reset snapshot")
-    p.add_argument("--num-envs", type=int, default=1,
-                   help="Number of parallel Fuse instances / training environments (default 1)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     extra_train_args = args.train_args.split() if args.train_args.strip() else []
-    num_envs = max(1, args.num_envs)
-    fuse_procs: list[subprocess.Popen] = []
+    fuse_proc: subprocess.Popen | None = None
 
     def shutdown(signum=None, frame=None):
         print("\n[loop] Interrupted — shutting down.")
-        for p in fuse_procs:
-            if p.poll() is None:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
+        if fuse_proc and fuse_proc.poll() is None:
+            try:
+                fuse_proc.terminate()
+            except Exception:
+                pass
         sys.exit(1)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    sockets = socket_paths_for(num_envs)
-
     for iteration in range(1, args.iterations + 1):
         print(f"\n{'━' * 60}")
-        print(f"  ITERATION {iteration} / {args.iterations}  ({num_envs} env(s))")
+        print(f"  ITERATION {iteration} / {args.iterations}")
         print(f"{'━' * 60}\n")
 
-        # 1. Clean up any previous Fuse instances.
-        for sp in sockets:
-            kill_existing_fuse(sp)
+        # 1. Clean up any previous Fuse instance.
+        kill_existing_fuse(FUSE_SOCKET)
 
-        # 2. Launch one Fuse per env.
-        fuse_procs = []
-        for sp in sockets:
-            proc = launch_fuse(sp, args.snapshot, FUSE_SPEED, args.visual)
-            fuse_procs.append(proc)
+        # 2. Launch Fuse.
+        fuse_proc = launch_fuse(FUSE_SOCKET, args.snapshot, FUSE_SPEED, args.visual)
 
-        # 3. Wait for all Fuse instances to be ready.
-        print(f"[loop] Waiting for {num_envs} Fuse socket(s) (up to {FUSE_READY_TIMEOUT_S}s each)…")
-        for i, sp in enumerate(sockets):
-            ready = wait_for_fuse_ready(sp, FUSE_READY_TIMEOUT_S, FUSE_READY_POLL_S)
-            if not ready:
-                print(f"[loop] ERROR: Fuse env {i} ({sp}) did not become ready in time.")
-                for p in fuse_procs:
-                    p.terminate()
-                sys.exit(1)
+        # 3. Wait for Fuse to be ready.
+        print(f"[loop] Waiting for Fuse socket (up to {FUSE_READY_TIMEOUT_S}s)…")
+        ready = wait_for_fuse_ready(FUSE_SOCKET, FUSE_READY_TIMEOUT_S, FUSE_READY_POLL_S)
+        if not ready:
+            print(f"[loop] ERROR: Fuse did not become ready in time.")
+            if fuse_proc.poll() is None:
+                fuse_proc.terminate()
+            sys.exit(1)
 
-        # 4. Run training.  train.py sends QUIT to Fuse instances when it finishes.
+        # 4. Run training.  train.py sends QUIT to Fuse when it finishes.
         load_model = args.model_out if args.continue_model else ""
         rc = run_training(
             timesteps=args.timesteps,
@@ -275,21 +251,19 @@ def main() -> None:
             load_model=load_model,
             extra_args=extra_train_args,
             visual=args.visual,
-            num_envs=num_envs,
         )
         if rc != 0:
             print(f"[loop] WARNING: train.py exited with code {rc}")
 
-        # 5. Ensure all Fuse instances are gone.
-        for i, (proc, sp) in enumerate(zip(fuse_procs, sockets)):
-            if proc.poll() is None:
-                print(f"[loop] Fuse env {i} still running — sending QUIT.")
-                kill_existing_fuse(sp)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.terminate()
-        fuse_procs = []
+        # 5. Ensure Fuse is gone.
+        if fuse_proc.poll() is None:
+            print("[loop] Fuse still running — sending QUIT.")
+            kill_existing_fuse(FUSE_SOCKET)
+            try:
+                fuse_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                fuse_proc.terminate()
+        fuse_proc = None
 
         # 6. Analyse.
         run_analysis(args.episode_log, tail=args.analysis_tail)
@@ -297,7 +271,6 @@ def main() -> None:
         if iteration < args.iterations:
             print(f"\n[loop] Iteration {iteration} complete. Starting next in 2s…")
             time.sleep(2.0)
-            # From the second iteration onwards always continue from saved model.
             args.continue_model = True
 
     print("\n[loop] All iterations complete.")

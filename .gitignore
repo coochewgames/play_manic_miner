@@ -2,4 +2,4 @@
 .venv
 tb_logs/
 episode_log*.jsonl
-ppo_manic_miner_*.zip
+*.zip

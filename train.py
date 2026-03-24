@@ -1,40 +1,78 @@
 #!/usr/bin/env python3
-"""Train an RL agent against Manic Miner in Fuse ML mode."""
+"""Train PPO with a custom CNN policy on the visual Manic Miner environment."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
 import socket
-import sys
-from typing import Any, Dict
+from typing import Dict, Any
 
-from sb3_contrib import MaskablePPO
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+import torch
+import torch.nn as nn
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
 from logging_utils import configure_logging
-from manic_env import ManicMinerEnv
+from manic_env_visual import ManicMinerVisualEnv
 
 logger = logging.getLogger(__name__)
 
 
-class SwitchToHeadlessCallback(BaseCallback):
-    """Switch env runtime mode from visual to headless after N timesteps."""
+# ── Custom CNN feature extractor ──────────────────────────────────────────────
+#
+# SB3's NatureCNN is designed for 84×84 Atari frames and its three
+# convolutional layers reduce a 24×32 input to zero height.  This extractor
+# uses smaller kernels suited to the 24×32 attribute grid.
+#
+# Input after VecTransposeImage: (B, C, 24, 32), C = n_stack (default 4).
+#
+# Spatial sizes after each layer:
+#   Conv(3, s=1, p=1)  →  (32, 24, 32)
+#   Conv(3, s=2)       →  (64, 11, 15)
+#   Conv(3, s=1)       →  (64,  9, 13)
+#   Flatten            →  64 × 9 × 13 = 7488
+#   Linear             →  features_dim
 
-    def __init__(self, switch_at_timesteps: int):
-        super().__init__()
-        self.switch_at_timesteps = max(1, int(switch_at_timesteps))
-        self.switched = False
 
-    def _on_step(self) -> bool:
-        if not self.switched and self.num_timesteps >= self.switch_at_timesteps:
-            self.training_env.env_method("set_runtime_mode", True, 0)
-            self.switched = True
-            logger.info("Switched to headless mode at timestep %s", self.num_timesteps)
-        return True
+class AttrGridCNN(BaseFeaturesExtractor):
+    """Small CNN suited to the 24×32 ZX Spectrum attribute grid."""
+
+    def __init__(self, observation_space, features_dim: int = 512):
+        super().__init__(observation_space, features_dim)
+
+        # SB3 transposes (H, W, C) → (C, H, W) before passing to the network.
+        # observation_space.shape is (C, H, W) at this point.
+        n_input_channels = observation_space.shape[0]
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_input_channels, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            sample = torch.zeros(1, *observation_space.shape)
+            n_flat = self.cnn(sample).shape[1]
+
+        self.linear = nn.Sequential(
+            nn.Linear(n_flat, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # SB3 normalises uint8 observations to [0, 1] before calling forward.
+        return self.linear(self.cnn(observations))
+
+
+# ── Callbacks ─────────────────────────────────────────────────────────────────
 
 
 class EpisodeLoggerCallback(BaseCallback):
@@ -43,26 +81,14 @@ class EpisodeLoggerCallback(BaseCallback):
     def __init__(self, log_path: str):
         super().__init__()
         self.log_path = log_path
-        self._episode_count = 0
-        self._reset_accumulators()
+        self._ep_count = 0
+        self._reset()
 
-    def _reset_accumulators(self) -> None:
+    def _reset(self) -> None:
         self._ep_steps = 0
-        self._ep_total_reward = 0.0
-        self._ep_objective = 0.0
-        self._ep_hazard = 0.0
-        self._ep_pathing = 0.0
-        self._ep_repeat_penalty = 0.0
-        self._ep_safety_triggers = 0
-        self._ep_jump_gate_blocks = 0
-        self._ep_life_losses = 0
-        self._ep_level = 0
-        self._ep_coverage_ratio = 0.0
-        self._ep_keys_remaining = 0
-        self._ep_configured_keys = 0
-
-    def _on_training_start(self) -> None:
-        logger.info("Episode log: %s", self.log_path)
+        self._ep_reward = 0.0
+        self._ep_score = 0
+        self._ep_deaths = 0
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -72,290 +98,163 @@ class EpisodeLoggerCallback(BaseCallback):
             return True
 
         info = infos[0] if isinstance(infos[0], dict) else {}
-        reward = float(rewards[0]) if len(rewards) > 0 else 0.0
-        done = bool(dones[0]) if len(dones) > 0 else False
-
-        state = info.get("state", {})
-        if not isinstance(state, dict):
-            state = {}
+        reward = float(rewards[0]) if rewards else 0.0
+        done = bool(dones[0]) if dones else False
 
         self._ep_steps += 1
-        self._ep_total_reward += reward
-        self._ep_objective += float(info.get("objective_reward", 0.0))
-        self._ep_hazard += float(info.get("hazard_reward", 0.0))
-        self._ep_pathing += float(info.get("pathing_reward", 0.0))
-        self._ep_repeat_penalty += float(info.get("repeat_penalty", 0.0))
-        if info.get("safety_blocked"):
-            self._ep_safety_triggers += 1
-        if info.get("jump_gate_blocked"):
-            self._ep_jump_gate_blocks += 1
-        if info.get("life_lost_this_step"):
-            self._ep_life_losses += 1
-
-        level = state.get("level", 0)
-        if isinstance(level, int):
-            self._ep_level = max(self._ep_level, level)
-
-        coverage = state.get("coverage_ratio", 0.0)
-        if isinstance(coverage, (int, float)):
-            self._ep_coverage_ratio = float(coverage)
-
-        keys_remaining = state.get("keys_remaining")
-        configured_keys = info.get("configured_keys_for_level")
-        if isinstance(keys_remaining, int):
-            self._ep_keys_remaining = keys_remaining
-        if isinstance(configured_keys, int):
-            self._ep_configured_keys = configured_keys
+        self._ep_reward += reward
+        if info.get("life_lost"):
+            self._ep_deaths += 1
+        score = info.get("score")
+        if isinstance(score, int):
+            self._ep_score = score
 
         if done:
-            if info.get("first_key_terminated"):
-                term_reason = "first_key"
-            elif state.get("lives", 1) == 0:
-                term_reason = "lives_exhausted"
-            elif info.get("life_lost_this_step"):
-                term_reason = "life_lost"
-            elif info.get("bridge_done"):
-                term_reason = "bridge_done"
-            else:
-                term_reason = "truncated"
-
-            keys_collected = max(0, self._ep_configured_keys - self._ep_keys_remaining)
-            self._episode_count += 1
+            self._ep_count += 1
             record: Dict[str, Any] = {
-                "episode": self._episode_count,
+                "episode": self._ep_count,
                 "timestep": self.num_timesteps,
                 "steps": self._ep_steps,
-                "total_reward": round(self._ep_total_reward, 3),
-                "objective_reward": round(self._ep_objective, 3),
-                "hazard_reward": round(self._ep_hazard, 3),
-                "pathing_reward": round(self._ep_pathing, 3),
-                "repeat_penalty": round(self._ep_repeat_penalty, 3),
-                "keys_collected": keys_collected,
-                "configured_keys": self._ep_configured_keys,
-                "keys_remaining": self._ep_keys_remaining,
-                "life_losses": self._ep_life_losses,
-                "safety_triggers": self._ep_safety_triggers,
-                "jump_gate_blocks": self._ep_jump_gate_blocks,
-                "level": self._ep_level,
-                "coverage_ratio": round(self._ep_coverage_ratio, 4),
-                "term_reason": term_reason,
+                "total_reward": round(self._ep_reward, 3),
+                "score": self._ep_score,
+                "deaths": self._ep_deaths,
             }
             try:
                 with open(self.log_path, "a") as f:
                     f.write(json.dumps(record) + "\n")
             except Exception as exc:
                 logger.warning("Failed to write episode log: %s", exc)
-
-            self._reset_accumulators()
+            self._reset()
 
         return True
 
 
-class RunSummaryCallback(BaseCallback):
-    """Log a run-level summary at the end of training."""
-
-    def __init__(self):
-        super().__init__()
-        self.max_level_seen = -1
-        self.configured_keys_by_level: Dict[int, int] = {}
-        self.min_keys_remaining_by_level: Dict[int, int] = {}
-        self.max_score_seen = 0
-
-    def _on_step(self) -> bool:
-        infos = self.locals.get("infos", [])
-        if not infos:
-            return True
-        info = infos[0] if isinstance(infos[0], dict) else {}
-        state = info.get("state", {}) if isinstance(info.get("state"), dict) else {}
-        level = state.get("level")
-        keys_remaining = state.get("keys_remaining")
-        score = state.get("score")
-        configured_keys = info.get("configured_keys_for_level")
-
-        if not isinstance(level, int) or not isinstance(keys_remaining, int):
-            return True
-
-        self.max_level_seen = max(self.max_level_seen, level)
-        if isinstance(score, int):
-            self.max_score_seen = max(self.max_score_seen, score)
-        if isinstance(configured_keys, int) and configured_keys >= 0:
-            prev_cfg = self.configured_keys_by_level.get(level, 0)
-            if configured_keys > prev_cfg:
-                self.configured_keys_by_level[level] = configured_keys
-            prev_min = self.min_keys_remaining_by_level.get(level, keys_remaining)
-            self.min_keys_remaining_by_level[level] = min(prev_min, keys_remaining)
-        return True
-
-    def _on_training_end(self) -> None:
-        if self.max_level_seen < 0:
-            logger.info("Run summary: no environment state samples captured")
-            return
-        level = self.max_level_seen
-        configured = self.configured_keys_by_level.get(level)
-        min_remaining = self.min_keys_remaining_by_level.get(level)
-        cavern = level + 1
-        if configured is None or min_remaining is None:
-            logger.info(
-                "Run summary: cavern=%s level=%s keys_collected=0 score=%s",
-                cavern, level, self.max_score_seen,
-            )
-            return
-        collected = max(0, configured - max(0, min(configured, min_remaining)))
-        logger.info(
-            "Run summary: cavern=%s level=%s keys_collected=%s/%s score=%s",
-            cavern, level, collected, configured, self.max_score_seen,
-        )
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train PPO on Fuse Manic Miner")
-    parser.add_argument("--socket", default="/tmp/fuse-ml.sock", help="UNIX socket path")
-    parser.add_argument("--socket-timeout-s", type=float, default=30.0,
-                        help="Timeout in seconds for each ML bridge command")
-    parser.add_argument("--timesteps", type=int, default=200_000, help="Training timesteps")
-    parser.add_argument("--frames-per-action", type=int, default=2, help="Frames to step per action")
-    parser.add_argument("--max-steps", type=int, default=4000, help="Max env steps per episode")
-    parser.add_argument("--random-action-prob", type=float, default=0.0,
-                        help="Probability of replacing chosen action with a random action")
-    parser.add_argument("--reset-random-action-steps", type=int, default=8,
-                        help="Maximum random warmup actions after RESET")
-    parser.add_argument("--model-out", default="ppo_manic_miner", help="Output model path prefix")
-    parser.add_argument("--load-model", default="",
-                        help="Path to an existing .zip model to continue training from")
-    parser.add_argument("--tensorboard-log", default=None, help="TensorBoard log dir (None disables)")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    parser.add_argument("--ent-coef", type=float, default=0.08,
-                        help="PPO entropy coefficient")
-    parser.add_argument("--gamma", type=float, default=0.999, help="PPO discount factor")
-    parser.add_argument("--n-steps", type=int, default=2048,
-                        help="PPO rollout buffer size")
-    parser.add_argument("--batch-size", type=int, default=256,
-                        help="PPO minibatch size")
-    parser.add_argument("--net-arch", type=int, nargs="+", default=[256, 256],
-                        help="Hidden layer sizes for the policy/value network")
-    parser.add_argument("--visual", action="store_true", help="Run Fuse in visual mode")
-    parser.add_argument("--visual-pace-ms", type=int, default=0,
-                        help="Visual pace per frame in ms")
-    parser.add_argument("--visual-steps", type=int, default=0,
-                        help="Switch to headless after this many timesteps (requires --visual)")
-    parser.add_argument("--include-bridge-reward", action="store_true",
-                        help="Add bridge reward field to shaped reward")
-    parser.add_argument("--pathing-reward", type=float, default=3.0,
-                        help="Reward per newly visited screen cell")
-    parser.add_argument("--first-key-mode", action="store_true",
-                        help="Curriculum: end episode on first key collected")
-    parser.add_argument("--first-key-success-bonus", type=float, default=120.0,
-                        help="Bonus reward for first key in --first-key-mode")
-    parser.add_argument("--num-keys-mode", type=int, default=0,
-                        help="Curriculum: terminate episode after collecting N keys (0=off, overrides --first-key-mode)")
-    parser.add_argument("--key-collect-reward", type=float, default=80.0,
-                        help="Reward per key collected (default 80)")
-    parser.add_argument("--disable-safety-shield", action="store_true",
-                        help="Disable lethal-action blocking")
-    parser.add_argument("--infinite-air", action="store_true",
-                        help="Poke air supply to max each step")
-    parser.add_argument("--episode-log", default="episode_log.jsonl",
-                        help="Path for per-episode JSONL log file")
-    parser.add_argument("--num-envs", type=int, default=1,
-                        help="Number of parallel environments (requires one Fuse socket per env)")
-    parser.add_argument("--socket-base", default="",
-                        help="Base socket path for parallel envs: e.g. /tmp/fuse-ml produces "
-                             "/tmp/fuse-ml-0.sock, /tmp/fuse-ml-1.sock, ... "
-                             "(ignored when --num-envs 1; use --socket instead)")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Train PPO (CnnPolicy) on visual Manic Miner")
+    p.add_argument("--socket", default="/tmp/fuse-ml.sock", help="UNIX socket path")
+    p.add_argument("--socket-timeout-s", type=float, default=30.0)
+    p.add_argument("--timesteps", type=int, default=200_000)
+    p.add_argument("--frames-per-action", type=int, default=3,
+                   help="Emulator frames advanced per agent action")
+    p.add_argument("--max-steps", type=int, default=4000,
+                   help="Max env steps per episode before truncation")
+    p.add_argument("--model-out", default="manic_visual", help="Output model path prefix (no .zip)")
+    p.add_argument("--load-model", default="", help="Path to an existing .zip to continue from")
+    p.add_argument("--tensorboard-log", default=None)
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    p.add_argument("--ent-coef", type=float, default=0.01, help="PPO entropy coefficient")
+    p.add_argument("--gamma", type=float, default=0.99, help="PPO discount factor")
+    p.add_argument("--n-steps", type=int, default=2048, help="PPO rollout buffer size")
+    p.add_argument("--batch-size", type=int, default=64, help="PPO minibatch size")
+    p.add_argument("--learning-rate", type=float, default=3e-4)
+    p.add_argument("--n-stack", type=int, default=4, help="Number of frames to stack")
+    p.add_argument("--features-dim", type=int, default=512,
+                   help="Output dimension of the CNN feature extractor")
+    p.add_argument("--death-penalty", type=float, default=1.0,
+                   help="Reward penalty applied when a life is lost")
+    p.add_argument("--score-scale", type=float, default=100.0,
+                   help="Divide raw score delta by this to produce reward")
+    p.add_argument("--warmup-steps", type=int, default=10,
+                   help="No-op steps after reset to let the snapshot finish loading")
+    p.add_argument("--no-infinite-air", action="store_true",
+                   help="Let the air supply deplete normally (default: infinite)")
+    p.add_argument("--pathing-reward", type=float, default=0.0,
+                   help="Reward per newly visited screen cell (0=off). "
+                        "Keep small (e.g. 0.01) so key reward (+1.0) stays dominant.")
+    p.add_argument("--key-proximity-reward", type=float, default=0.0,
+                   help="Reward scale for getting closer to the first (green) key each step. "
+                        "Disabled once that key is collected. (0=off, try 0.3)")
+    p.add_argument("--visual", action="store_true", help="Run Fuse in visual mode")
+    p.add_argument("--visual-pace-ms", type=int, default=0)
+    p.add_argument("--episode-log", default="episode_log.jsonl")
+    p.add_argument("--device", default="auto",
+                   help="PyTorch device: auto, cpu, cuda, mps (default: auto)")
+    return p.parse_args()
 
 
-def check_fuse_reset_snapshot_env() -> None:
-    snapshot_path = os.environ.get("FUSE_ML_RESET_SNAPSHOT", "").strip()
-    if not snapshot_path:
-        logger.warning("FUSE_ML_RESET_SNAPSHOT is not set")
-        return
-    if not os.path.isfile(snapshot_path):
-        logger.warning("FUSE_ML_RESET_SNAPSHOT does not exist or is not a file: %s", snapshot_path)
-        return
-    if not os.access(snapshot_path, os.R_OK):
-        logger.warning("FUSE_ML_RESET_SNAPSHOT is not readable: %s", snapshot_path)
-        return
-    logger.info("Fuse reset snapshot: %s", snapshot_path)
+# ── main ──────────────────────────────────────────────────────────────────────
+
+
+def resolve_device(requested: str) -> str:
+    """Return the best available PyTorch device string."""
+    import torch
+    if requested != "auto":
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def main() -> None:
     args = parse_args()
     configure_logging(level=getattr(logging, args.log_level))
-    check_fuse_reset_snapshot_env()
+    device = resolve_device(args.device)
+    logger.info("Using device: %s", device)
 
-    def make_env(socket_path: str):
-        def _factory():
-            return ManicMinerEnv(
-                socket_path=socket_path,
-                socket_timeout_s=args.socket_timeout_s,
-                frames_per_action=args.frames_per_action,
-                max_steps=args.max_steps,
-                headless=not args.visual,
-                visual_pace_ms=args.visual_pace_ms,
-                auto_reset_on_done=False,
-                include_bridge_reward=args.include_bridge_reward,
-                random_action_prob=args.random_action_prob,
-                reset_random_action_steps=args.reset_random_action_steps,
-                first_key_mode=args.first_key_mode,
-                first_key_success_bonus=args.first_key_success_bonus,
-                num_keys_mode=args.num_keys_mode,
-                safety_shield=not args.disable_safety_shield,
-                pathing_new_cell_reward=args.pathing_reward,
-                key_collect_reward=args.key_collect_reward,
-                infinite_air=args.infinite_air,
-            )
-        return _factory
+    def make_env():
+        return ManicMinerVisualEnv(
+            socket_path=args.socket,
+            socket_timeout_s=args.socket_timeout_s,
+            frames_per_action=args.frames_per_action,
+            max_steps=args.max_steps,
+            headless=not args.visual,
+            visual_pace_ms=args.visual_pace_ms,
+            death_penalty=args.death_penalty,
+            score_scale=args.score_scale,
+            warmup_steps=args.warmup_steps,
+            infinite_air=not args.no_infinite_air,
+            pathing_reward=args.pathing_reward,
+            key_proximity_reward=args.key_proximity_reward,
+        )
 
-    num_envs = max(1, args.num_envs)
-    if num_envs > 1:
-        if not args.socket_base:
-            raise ValueError("--socket-base is required when --num-envs > 1")
-        socket_paths = [f"{args.socket_base}-{i}.sock" for i in range(num_envs)]
-        logger.info("Using %d parallel envs on sockets: %s", num_envs, socket_paths)
-        env_fns = [make_env(sp) for sp in socket_paths]
-        vec_env = VecMonitor(SubprocVecEnv(env_fns))
-    else:
-        vec_env = VecMonitor(DummyVecEnv([make_env(args.socket)]))
+    # Stack 4 frames; SB3 will apply VecTransposeImage automatically for CnnPolicy.
+    vec_env = VecMonitor(
+        VecFrameStack(DummyVecEnv([make_env]), n_stack=args.n_stack)
+    )
+
+    policy_kwargs = {
+        "features_extractor_class": AttrGridCNN,
+        "features_extractor_kwargs": {"features_dim": args.features_dim},
+    }
 
     if args.load_model:
-        model = MaskablePPO.load(args.load_model, env=vec_env, tensorboard_log=args.tensorboard_log)
+        model = PPO.load(
+            args.load_model,
+            env=vec_env,
+            device=device,
+            tensorboard_log=args.tensorboard_log,
+        )
         logger.info("Loaded model from %s", args.load_model)
     else:
-        model = MaskablePPO(
-            "MlpPolicy",
+        model = PPO(
+            "CnnPolicy",
             vec_env,
             verbose=1,
             n_steps=args.n_steps,
             batch_size=args.batch_size,
-            learning_rate=3e-4,
+            learning_rate=args.learning_rate,
             gamma=args.gamma,
             ent_coef=args.ent_coef,
-            policy_kwargs={"net_arch": args.net_arch},
+            policy_kwargs=policy_kwargs,
+            device=device,
             tensorboard_log=args.tensorboard_log,
         )
-
-    callbacks: list = [
-        RunSummaryCallback(),
-        EpisodeLoggerCallback(args.episode_log),
-    ]
-    if args.visual and args.visual_steps > 0:
-        callbacks.append(SwitchToHeadlessCallback(args.visual_steps))
 
     learn_completed = False
     timed_out = False
     try:
         try:
-            # Always reset the timestep counter so --timesteps means exactly
-            # "train for this many additional steps".  Policy weights are
-            # preserved regardless of reset_num_timesteps.
             model.learn(
                 total_timesteps=args.timesteps,
                 progress_bar=False,
-                callback=CallbackList(callbacks),
+                callback=EpisodeLoggerCallback(args.episode_log),
                 reset_num_timesteps=True,
-                use_masking=True,
             )
             learn_completed = True
         except socket.timeout as exc:
@@ -364,7 +263,10 @@ def main() -> None:
     finally:
         try:
             model.save(args.model_out)
-            label = "partial (timeout)" if timed_out else ("partial (interrupted)" if not learn_completed else "")
+            label = (
+                "partial (timeout)" if timed_out
+                else ("partial (interrupted)" if not learn_completed else "")
+            )
             suffix = f" [{label}]" if label else ""
             logger.info("Saved model to %s.zip%s", args.model_out, suffix)
         except Exception as exc:
