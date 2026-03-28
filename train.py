@@ -14,6 +14,7 @@ import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
 from logging_utils import configure_logging
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 # uses smaller kernels suited to the 16×32 semantic grid.
 #
 # Input after VecTransposeImage: (B, C, 16, 32),
-#   C = 5 channels (solid, nasty, willy, guardian, key) × n_stack (default 4) = 20.
+#   C = 7 channels (solid, nasty, willy, guardian, key, portal, waypoint) × n_stack (default 4) = 28.
 #
 # Spatial sizes after each layer:
 #   Conv(3, s=1, p=1)  →  (32, 16, 32)
@@ -164,8 +165,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-infinite-air", action="store_true",
                    help="Let the air supply deplete normally (default: infinite)")
     p.add_argument("--pathing-reward", type=float, default=0.01,
-                   help="Reward per newly visited screen cell (0=off). "
-                        "Keep small (e.g. 0.01) so key reward (+1.0) stays dominant.")
+                   help="Base reward for the first newly visited cell each episode.")
+    p.add_argument("--pathing-reward-increment", type=float, default=0.0002,
+                   help="Amount added to the pathing reward for each subsequent new cell "
+                        "(linear increase: nth new cell = base + (n-1)*increment).")
+    p.add_argument("--proximity-reward", type=float, default=0.0,
+                   help="Reward per BFS step closer to the nearest key (only on approach).")
     p.add_argument("--visual", action="store_true", help="Run Fuse in visual mode")
     p.add_argument("--visual-pace-ms", type=int, default=0)
     p.add_argument("--episode-log", default="episode_log.jsonl")
@@ -208,6 +213,8 @@ def main() -> None:
             warmup_steps=args.warmup_steps,
             infinite_air=not args.no_infinite_air,
             pathing_reward=args.pathing_reward,
+            pathing_reward_increment=args.pathing_reward_increment,
+            proximity_reward=args.proximity_reward,
         )
 
     # Stack 4 frames; SB3 will apply VecTransposeImage automatically for CnnPolicy.
@@ -227,7 +234,15 @@ def main() -> None:
             device=device,
             tensorboard_log=args.tensorboard_log,
         )
-        logger.info("Loaded model from %s", args.load_model)
+        # Apply CLI learning rate — PPO.load restores the saved rate by default.
+        # Must replace lr_schedule too; SB3 calls _update_learning_rate each update
+        # which overwrites optimizer param groups from the schedule.
+        model.learning_rate = args.learning_rate
+        model.lr_schedule = get_schedule_fn(args.learning_rate)
+        for param_group in model.policy.optimizer.param_groups:
+            param_group["lr"] = args.learning_rate
+        logger.info("Loaded model from %s (lr set to %s)", args.load_model, args.learning_rate)
+
     else:
         model = PPO(
             "CnnPolicy",

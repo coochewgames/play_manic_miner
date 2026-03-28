@@ -24,13 +24,15 @@ FUSE_SOCKET   = "/tmp/fuse-ml.sock"
 FUSE_SNAPSHOT = "/Users/roddy/Dev/fuse/play_manic_miner/manicminer.szx"
 FUSE_SPEED    = 800   # slower than training so the window is visible
 
-CHANNEL_NAMES  = ["SOLID", "NASTY", "WILLY", "GUARDIAN", "KEY"]
+CHANNEL_NAMES  = ["SOLID", "NASTY", "WILLY", "GUARDIAN", "KEY", "PORTAL", "WAYPOINT"]
 CHANNEL_GLYPHS = [
     (" ", "#"),   # SOLID
     (" ", "X"),   # NASTY
     (" ", "W"),   # WILLY
     (" ", "G"),   # GUARDIAN
     (" ", "K"),   # KEY
+    (" ", "P"),   # PORTAL
+    (" ", ">"),   # WAYPOINT
 ]
 
 # ── emulator helpers ──────────────────────────────────────────────────────────
@@ -92,7 +94,7 @@ def print_channel(name: str, grid, glyph_off: str, glyph_on: str) -> None:
 
 def print_composite(obs) -> None:
     """All channels overlaid; later channels (higher index) take priority."""
-    print("\n  COMPOSITE  (# solid, X nasty, W willy, G guardian, K key, . empty)")
+    print("\n  COMPOSITE  (# solid, X nasty, W willy, G guardian, K key, P portal, > waypoint, . empty)")
     print("  +" + "-" * GAME_CELLS_W + "+")
     for row in range(GAME_CELLS_H):
         line = []

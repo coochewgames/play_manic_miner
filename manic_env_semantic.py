@@ -26,6 +26,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from ml_client import FuseMLClient
+from pathfinder import build_movement_graph, find_bfs_distance, find_waypoint
 from manic_data import (
     AIR_SUPPLY_ADDR,
     AIR_SUPPLY_MAX,
@@ -54,7 +55,7 @@ ACTIONS = [
 # Observation geometry (game play area only — status bar excluded)
 GAME_CELLS_H = 16
 GAME_CELLS_W = SCREEN_CELLS_W  # 32
-N_CHANNELS = 5
+N_CHANNELS = 7
 
 # Channel indices
 CH_SOLID    = 0
@@ -62,6 +63,8 @@ CH_NASTY    = 1
 CH_WILLY    = 2
 CH_GUARDIAN = 3
 CH_KEY      = 4
+CH_PORTAL   = 5  # active portal cells — flash bit (bit 7) set in screen attr
+CH_WAYPOINT = 6  # next BFS step toward nearest uncollected key
 
 # ROM tile definitions: 8 tiles × 9 bytes, at offset 0x0220 within room data.
 # Byte 0 of each record is the attribute byte for that tile type.
@@ -104,6 +107,8 @@ class ManicMinerSemanticEnv(gym.Env):
         warmup_steps: int = 10,
         infinite_air: bool = True,
         pathing_reward: float = 0.01,
+        pathing_reward_increment: float = 0.001,
+        proximity_reward: float = 0.0,
     ):
         super().__init__()
         self.socket_path = socket_path
@@ -117,11 +122,13 @@ class ManicMinerSemanticEnv(gym.Env):
         self.warmup_steps = warmup_steps
         self.infinite_air = infinite_air
         self.pathing_reward = pathing_reward
+        self.pathing_reward_increment = pathing_reward_increment
+        self.proximity_reward = proximity_reward
 
         self.observation_space = spaces.Box(
             low=0,
             high=255,
-            shape=(GAME_CELLS_H, GAME_CELLS_W, N_CHANNELS),
+            shape=(GAME_CELLS_H, GAME_CELLS_W, N_CHANNELS),  # (16, 32, 7)
             dtype=np.uint8,
         )
         self.action_space = spaces.Discrete(len(ACTIONS))
@@ -133,12 +140,24 @@ class ManicMinerSemanticEnv(gym.Env):
         self._visited_cells: set = set()
 
         # Static grids built at reset from ROM + live game attr buffer
-        self._solid_grid = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
-        self._nasty_grid = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
-        self._key_grid   = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
+        self._solid_grid        = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
+        self._nasty_grid        = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
+        self._key_grid          = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
+        self._conveyor_tile_grid = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
+        # Dynamic: updated each step from screen attr flash bits
+        self._portal_grid = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
+        # Movement graph for BFS pathfinding; built once per episode
+        self._movement_graph: dict = {}
+        # Waypoint from previous step (for new-cell-gated proximity bonus)
+        self._prev_waypoint: tuple | None = None
 
         # Active (uncollected) key positions — updated as keys are collected
         self._active_keys: list[tuple[int, int]] = []
+        # Highest-priority keys: subset of _active_keys with max reachability score
+        # (most other keys reachable from that key's position).  Recomputed at reset
+        # and after each key collection.  Ensures K5(30,6) is targeted first because
+        # it is in the lower half and unreachable once Willy crosses into upper half.
+        self._priority_keys: list[tuple[int, int]] = []
 
     # ── connection ─────────────────────────────────────────────────────────────
 
@@ -202,6 +221,11 @@ class ManicMinerSemanticEnv(gym.Env):
         self._solid_grid = np.isin(cells, solid_attrs).astype(np.uint8) * 255
         self._nasty_grid = np.isin(cells, nasty_attrs).astype(np.uint8) * 255
 
+        # Track conveyor tile positions separately so the pathfinder can restrict
+        # movement from conveyor-surface cells (leftward walk only, no jumps).
+        conveyor_attr = tile_attr_bytes[4]
+        self._conveyor_tile_grid = (cells == conveyor_attr).astype(np.uint8) * 255
+
     def _parse_key_cells(self, room_data: bytes) -> list[tuple[int, int]]:
         """Decode the 5 key positions for level 0 from ROM room data."""
         cells = []
@@ -226,17 +250,68 @@ class ManicMinerSemanticEnv(gym.Env):
         for kx, ky in self._active_keys:
             self._key_grid[ky, kx] = 255
 
+    def _update_key_priorities(self) -> None:
+        """Score each remaining key by how many OTHER remaining keys are reachable
+        from it, then keep only the highest-scoring key(s) as priority targets.
+
+        This prevents stranding K5(30,6): once Willy crosses the all-solid y=5
+        row into the upper half (y=0-4) he cannot return, so K5 must be collected
+        first.  K5 scores 4 (can reach all others); K1-K4 score 2-3.  Routing
+        toward the max-score key(s) ensures K5 is targeted first.
+        """
+        if not self._active_keys:
+            self._priority_keys = []
+            return
+        scores: dict[tuple[int, int], int] = {}
+        for k in self._active_keys:
+            if k not in self._movement_graph:
+                scores[k] = 0
+                continue
+            count = sum(
+                1 for other in self._active_keys
+                if other != k and find_bfs_distance(self._movement_graph, k, [other]) < 1e9
+            )
+            scores[k] = count
+        max_score = max(scores.values(), default=0)
+        self._priority_keys = [k for k, s in scores.items() if s == max_score]
+
+    def _key_approach_targets(self) -> list[tuple[int, int]]:
+        """Return approach targets for the highest-priority remaining keys.
+
+        Uses self._priority_keys (keys that preserve maximum future reachability).
+        Falls back to all active keys if no priority key yields a valid graph node.
+        """
+        def _targets_for(key_list: list[tuple[int, int]]) -> list[tuple[int, int]]:
+            targets: list[tuple[int, int]] = []
+            for kx, ky in key_list:
+                if (kx, ky) in self._movement_graph:
+                    targets.append((kx, ky))
+                else:
+                    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                        nb = (kx + dx, ky + dy)
+                        if nb in self._movement_graph:
+                            targets.append(nb)
+            return targets
+
+        targets = _targets_for(self._priority_keys)
+        if targets:
+            return targets
+        # Fallback: try all active keys (handles edge cases after key collection)
+        return _targets_for(self._active_keys)
+
     # ── observation assembly ───────────────────────────────────────────────────
 
     def _build_obs(
         self,
         willy_cell: tuple[int, int],
         guardian_cell: tuple[int, int] | None,
+        waypoint_cell: tuple[int, int] | None = None,
     ) -> np.ndarray:
         obs = np.zeros((GAME_CELLS_H, GAME_CELLS_W, N_CHANNELS), dtype=np.uint8)
         obs[:, :, CH_SOLID]  = self._solid_grid
         obs[:, :, CH_NASTY]  = self._nasty_grid
         obs[:, :, CH_KEY]    = self._key_grid
+        obs[:, :, CH_PORTAL] = self._portal_grid
 
         wx, wy = willy_cell
         for dy in range(2):  # Willy's sprite is 2 cells tall
@@ -250,6 +325,11 @@ class ManicMinerSemanticEnv(gym.Env):
                 row = gy + dy
                 if 0 <= row < GAME_CELLS_H and 0 <= gx < GAME_CELLS_W:
                     obs[row, gx, CH_GUARDIAN] = 255
+
+        if waypoint_cell is not None:
+            wpx, wpy = waypoint_cell
+            if 0 <= wpy < GAME_CELLS_H and 0 <= wpx < GAME_CELLS_W:
+                obs[wpy, wpx, CH_WAYPOINT] = 255
 
         return obs
 
@@ -275,23 +355,49 @@ class ManicMinerSemanticEnv(gym.Env):
         self._active_keys = self._parse_key_cells(room_data)
         self._rebuild_key_grid()
 
+        # Key cells in the game attr buffer show the underlying tile's attr because
+        # keys are drawn on top of existing tiles.  Clear solid, nasty, and conveyor
+        # at every key position so the BFS treats them as free, passable cells.
+        for kx, ky in self._active_keys:
+            if 0 <= ky < GAME_CELLS_H and 0 <= kx < GAME_CELLS_W:
+                self._solid_grid[ky, kx] = 0
+                self._nasty_grid[ky, kx] = 0
+                self._conveyor_tile_grid[ky, kx] = 0
+
+        # Build movement graph for BFS pathfinding (depends on static grids)
+        self._movement_graph = build_movement_graph(
+            self._solid_grid, self._nasty_grid, self._conveyor_tile_grid
+        )
+        self._update_key_priorities()
+
+        self._portal_grid = np.zeros((GAME_CELLS_H, GAME_CELLS_W), dtype=np.uint8)
         self._score, self._lives = self._read_state()
         self._step_count = 0
         self._visited_cells = set()
+        self._pathing_n = 0  # count of new cells visited this episode
 
         willy_cell = self._read_willy_cell()
         guardian_cell = self._read_guardian_cell()
         if self.pathing_reward > 0.0:
             self._visited_cells.add(willy_cell)
 
-        return self._build_obs(willy_cell, guardian_cell), {}
+        waypoint_cell = find_waypoint(self._movement_graph, willy_cell, self._key_approach_targets())
+        self._prev_waypoint = waypoint_cell
+        return self._build_obs(willy_cell, guardian_cell, waypoint_cell), {}
 
     def step(self, action: int):
         assert self._client is not None, "reset() must be called before step()"
 
         key_chord = ACTIONS[int(action)]
-        self._client.step_attrs(key_chord, self.frames_per_action)
+        _, attr_bytes = self._client.step_attrs(key_chord, self.frames_per_action)
         self._poke_air()
+
+        # Portal channel: any cell in the game area with the flash bit (bit 7) set.
+        # step_attrs returns the full 32×24 screen attr (768 bytes); game area is rows 0–15.
+        screen_game = np.frombuffer(
+            attr_bytes[:GAME_CELLS_H * GAME_CELLS_W], dtype=np.uint8
+        ).reshape(GAME_CELLS_H, GAME_CELLS_W)
+        self._portal_grid = ((screen_game & 0x80) != 0).astype(np.uint8) * 255
         self._step_count += 1
 
         new_score, new_lives = self._read_state()
@@ -301,9 +407,15 @@ class ManicMinerSemanticEnv(gym.Env):
         willy_cell = self._read_willy_cell()
         guardian_cell = self._read_guardian_cell()
 
-        if self.pathing_reward > 0.0 and willy_cell not in self._visited_cells:
+        if self._active_keys and willy_cell not in self._visited_cells:
             self._visited_cells.add(willy_cell)
-            reward += self.pathing_reward
+            if self.pathing_reward > 0.0:
+                reward += self.pathing_reward + self._pathing_n * self.pathing_reward_increment
+                self._pathing_n += 1
+            # Extra bonus for first visit to a waypoint cell (cannot be farmed —
+            # each cell can only be "new" once per episode).
+            if self.proximity_reward > 0.0 and self._prev_waypoint is not None and willy_cell == self._prev_waypoint:
+                reward += self.proximity_reward
 
         # Remove collected keys (100 points each); use nearest-to-Willy heuristic
         keys_collected = score_delta // 100
@@ -316,6 +428,7 @@ class ManicMinerSemanticEnv(gym.Env):
                 )
                 self._active_keys.remove(nearest)
             self._rebuild_key_grid()
+            self._update_key_priorities()
 
         life_lost = new_lives < self._lives
         if life_lost:
@@ -327,13 +440,16 @@ class ManicMinerSemanticEnv(gym.Env):
         terminated = life_lost
         truncated = (not terminated) and (self._step_count >= self.max_steps)
 
+        waypoint_cell = find_waypoint(self._movement_graph, willy_cell, self._key_approach_targets())
+        self._prev_waypoint = waypoint_cell
+
         info = {
             "score": new_score,
             "lives": new_lives,
             "life_lost": life_lost,
             "step": self._step_count,
         }
-        return self._build_obs(willy_cell, guardian_cell), reward, terminated, truncated, info
+        return self._build_obs(willy_cell, guardian_cell, waypoint_cell), reward, terminated, truncated, info
 
     # ── lifecycle helpers ──────────────────────────────────────────────────────
 
