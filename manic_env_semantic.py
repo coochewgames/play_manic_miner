@@ -44,7 +44,7 @@ from manic_data import (
 )
 
 ACTIONS = [
-    "0",        # 0: no-op
+    "-",        # 0: no-op
     "q",        # 1: left
     "w",        # 2: right
     "space",    # 3: jump
@@ -166,7 +166,7 @@ class ManicMinerSemanticEnv(gym.Env):
             self._client = FuseMLClient(self.socket_path, self.socket_timeout_s)
             if self.headless:
                 self._client.mode_headless()
-            elif self.visual_pace_ms > 0:
+            else:
                 self._client.mode_visual(self.visual_pace_ms)
 
     # ── memory readers ─────────────────────────────────────────────────────────
