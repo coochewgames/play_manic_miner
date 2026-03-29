@@ -3,3 +3,4 @@
 tb_logs/
 episode_log*.jsonl
 *.zip
+.DS_Store
