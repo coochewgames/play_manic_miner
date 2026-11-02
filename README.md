@@ -110,8 +110,14 @@ The planning and execution problems are separable. Solving them together with a 
 cd play_manic_miner
 python3 -m venv .venv
 source .venv/bin/activate
-pip install stable-baselines3 gymnasium numpy
+pip install stable-baselines3==2.7.1 gymnasium==1.1.1 numpy==2.0.2 torch==2.8.0
 ```
+
+These versions were last used with Python 3.9.6. To use `--tensorboard-log` in `train.py`, also run `pip install tensorboard==2.20.0`.
+
+`.venv` (about 560 MB) is not in the repository. It can be deleted at any time and rebuilt with the commands above.
+
+Trained models (`*.zip`) and episode logs (`episode_log*.jsonl`) are also not in the repository, and cannot be rebuilt without retraining. A fresh clone has no `manic_semantic.zip`, so `--continue-model` needs a copy of that file from elsewhere.
 
 **Run a training loop:**
 
